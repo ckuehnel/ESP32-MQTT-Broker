@@ -28,7 +28,7 @@
 
 // WLAN Parameter
 const char* ssid = "FRITZ!Box 7590 RI";
-const char* password = "52261156805385776967";
+const char* password = "53267156905389775977";
 
 const int mqttPort = 1883;
 WiFiServer mqttServer(mqttPort);
