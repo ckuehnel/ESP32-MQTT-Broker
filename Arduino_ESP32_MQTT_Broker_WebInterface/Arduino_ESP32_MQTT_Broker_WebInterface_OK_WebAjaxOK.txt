@@ -1,0 +1,595 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <vector>
+#include <map>
+#include <algorithm> // Für std::remove_if
+#include <ArduinoJson.h> // NEU: Für JSON-Serialisierung
+
+// WLAN Parameter
+const char* ssid = "FRITZ!Box 7590 RI";
+const char* password = "52261156805385776967";
+
+const int mqttPort = 1883;
+WiFiServer mqttServer(mqttPort);
+WebServer web(80);
+
+struct Message {
+    String topic;
+    String payload;
+    unsigned long timestamp; // NEU: Zeitstempel hinzufügen
+};
+
+struct MQTTClientState {
+    WiFiClient client;
+    String clientId;
+    unsigned long lastSeen;
+    String willTopic;
+    String willMessage;
+    bool hasLWT;
+    bool connectedACKSent = false;
+    std::vector<String> subscribedTopics;
+};
+
+// Die globale Liste aller verbundenen MQTT-Clients
+std::vector<MQTTClientState> connectedMQTTClients;
+
+// Die Struktur für Abonnements, die jetzt auf MQTTClientState zeigt
+struct ActiveSubscription {
+    MQTTClientState* clientState; // Pointer to the active client state
+    String topicFilter; // The topic filter subscribed to
+};
+std::vector<ActiveSubscription> activeSubscriptions;
+
+// ===========================================
+// Ende der neu angeordneten Strukturen
+// ===========================================
+
+
+std::map<String, String> retainedMessages;
+std::vector<Message> messageLog;    // Für Webinterface (Jetzt ist Message bekannt!)
+
+// --- NEU: Globale Datenstrukturen, die über AJAX abgefragt werden ---
+// Beachten Sie, dass messageLog bereits vorhanden ist
+// retainedMessages ist bereits vorhanden
+// connectedMQTTClients ist bereits vorhanden
+// ------------------------------------------------------------------
+
+// Hilfsfunktion: Warte auf bestimmte Anzahl Bytes im Client
+bool waitForBytes(WiFiClient& client, int length, unsigned long timeout = 1000) {
+    unsigned long start = millis();
+    while (client.available() < length) {
+        if (millis() - start > timeout) return false;
+        delay(1);
+    }
+    return true;
+}
+
+// Hilfsfunktion: Zerlegt ein Topic in seine Segmente
+std::vector<String> splitTopic(const String& topic) {
+    std::vector<String> parts;
+    int start = 0;
+    int idx = topic.indexOf('/', start);
+    while (idx != -1) {
+        parts.push_back(topic.substring(start, idx));
+        start = idx + 1;
+        idx = topic.indexOf('/', start);
+    }
+    parts.push_back(topic.substring(start));
+    return parts;
+}
+
+// Hilfsfunktion: Überprüft, ob ein Topic mit einem Filter übereinstimmt (für Wildcards)
+bool topicMatches(const String& topic, const String& filter) {
+    if (filter == "#") return true; // Matches anything
+
+    std::vector<String> topicParts = splitTopic(topic);
+    std::vector<String> filterParts = splitTopic(filter);
+
+    // Special case for '#' at the end
+    if (!filterParts.empty() && filterParts.back() == "#") {
+        if (topicParts.size() >= filterParts.size() - 1) {
+            for (size_t i = 0; i < filterParts.size() - 1; ++i) {
+                if (filterParts[i] == "+") continue;
+                if (topicParts[i] != filterParts[i]) return false;
+            }
+            return true;
+        } else {
+            return false; // "#" only matches if there are enough levels
+        }
+    }
+
+    // Exact match or '+' wildcard
+    if (topicParts.size() != filterParts.size()) return false;
+
+    for (size_t i = 0; i < topicParts.size(); ++i) {
+        if (filterParts[i] == "+") continue;
+        if (topicParts[i] != filterParts[i]) return false;
+    }
+    return true;
+}
+
+// --- NEUE FUNKTIONEN FÜR AJAX ---
+
+// Handler für AJAX-Anfragen an /mqtt_data
+void handleMqttData() {
+    DynamicJsonDocument doc(2048); // Anpassbare Größe basierend auf erwarteten Datenmenge
+
+    // Message Log
+    JsonArray messagesArray = doc.createNestedArray("messageLog");
+    for (auto &msg : messageLog) {
+        JsonObject msgObj = messagesArray.createNestedObject();
+        msgObj["topic"] = msg.topic;
+        msgObj["payload"] = msg.payload;
+        msgObj["timestamp"] = msg.timestamp; // Hinzufügen des Zeitstempels
+    }
+
+    // Retained Messages
+    JsonObject retainedObj = doc.createNestedObject("retainedMessages");
+    for (auto const& [topic, payload] : retainedMessages) {
+        retainedObj[topic] = payload;
+    }
+
+    // Connected Clients
+    JsonArray clientsArray = doc.createNestedArray("connectedClients");
+    for (auto &clientState : connectedMQTTClients) {
+        JsonObject clientObj = clientsArray.createNestedObject();
+        clientObj["id"] = clientState.clientId;
+        clientObj["lastSeen"] = millis() - clientState.lastSeen; // Zeit seit letzter Aktivität
+        JsonArray subTopicsArray = clientObj.createNestedArray("subscribedTopics");
+        for (const String& topic : clientState.subscribedTopics) {
+            subTopicsArray.add(topic);
+        }
+    }
+
+    // WLAN Info
+    doc["wifi_ssid"] = String(ssid);
+    doc["wifi_ip"] = WiFi.localIP().toString();
+
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+
+    web.send(200, "application/json", jsonResponse);
+}
+
+
+// Webinterface HTML Seite
+void handleRoot() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 MQTT Broker</title>";
+    html += "<style>body{font-family:Arial;margin:20px;}table{border-collapse:collapse;width:100%;}";
+    html += "th,td{border:1px solid #ccc;padding:8px;text-align:left;}</style>";
+    html += "</head><body>";
+    html += "<h1>MQTT Nachrichten Log</h1>";
+    html += "<table id='messageLogTable'><thead><tr><th>Topic</th><th>Payload</th><th>Zuletzt empfangen</th></tr></thead><tbody></tbody></table>";
+
+    html += "<h2>Retained Messages</h2><table id='retainedMessagesTable'><thead><tr><th>Topic</th><th>Payload</th></tr></thead><tbody></tbody></table>";
+
+    html += "<h2>Connected MQTT Clients</h2><table id='connectedClientsTable'><thead><tr><th>Client ID</th><th>Last Seen (ms)</th><th>Subscribed Topics</th></tr></thead><tbody></tbody></table>";
+
+    html += "<p>Verbunden mit: <span id='wifiSsid'></span><br>IP-Adresse: <span id='wifiIp'></span></p>";
+
+    // NEU: JavaScript für AJAX
+    html += "<script>";
+    html += "function fetchData() {";
+    html += "    var xhr = new XMLHttpRequest();";
+    html += "    xhr.onreadystatechange = function() {";
+    html += "        if (xhr.readyState == 4 && xhr.status == 200) {";
+    html += "            var data = JSON.parse(xhr.responseText);";
+
+    // Message Log aktualisieren
+    html += "            var messageLogTableBody = document.getElementById('messageLogTable').getElementsByTagName('tbody')[0];";
+    html += "            messageLogTableBody.innerHTML = '';"; // Tabelle leeren
+    html += "            data.messageLog.forEach(function(item) {";
+    html += "                var row = messageLogTableBody.insertRow();";
+    html += "                row.insertCell(0).innerText = item.topic;";
+    html += "                row.insertCell(1).innerText = item.payload;";
+    html += "                row.insertCell(2).innerText = new Date(item.timestamp).toLocaleTimeString();"; // Zeitstempel formatieren
+    html += "            });";
+
+    // Retained Messages aktualisieren
+    html += "            var retainedMessagesTableBody = document.getElementById('retainedMessagesTable').getElementsByTagName('tbody')[0];";
+    html += "            retainedMessagesTableBody.innerHTML = '';"; // Tabelle leeren
+    html += "            for (var topic in data.retainedMessages) {";
+    html += "                if (data.retainedMessages.hasOwnProperty(topic)) {";
+    html += "                    var row = retainedMessagesTableBody.insertRow();";
+    html += "                    row.insertCell(0).innerText = topic;";
+    html += "                    row.insertCell(1).innerText = data.retainedMessages[topic];";
+    html += "                }";
+    html += "            }";
+
+    // Connected Clients aktualisieren
+    html += "            var connectedClientsTableBody = document.getElementById('connectedClientsTable').getElementsByTagName('tbody')[0];";
+    html += "            connectedClientsTableBody.innerHTML = '';"; // Tabelle leeren
+    html += "            data.connectedClients.forEach(function(item) {";
+    html += "                var row = connectedClientsTableBody.insertRow();";
+    html += "                row.insertCell(0).innerText = item.id;";
+    html += "                row.insertCell(1).innerText = item.lastSeen + ' ms ago';";
+    html += "                var topicsCell = row.insertCell(2);";
+    html += "                item.subscribedTopics.forEach(function(topic) {";
+    html += "                    topicsCell.innerHTML += topic + '<br>';";
+    html += "                });";
+    html += "            });";
+
+    // WLAN Info aktualisieren
+    html += "            document.getElementById('wifiSsid').innerText = data.wifi_ssid;";
+    html += "            document.getElementById('wifiIp').innerText = data.wifi_ip;";
+
+
+    html += "        }";
+    html += "    };";
+    html += "    xhr.open('GET', '/mqtt_data', true);"; // AJAX-Endpunkt
+    html += "    xhr.send();";
+    html += "}";
+    html += "setInterval(fetchData, 2000); // Alle 2 Sekunden aktualisieren (anpassbar)";
+    html += "window.onload = fetchData;"; // Erste Daten beim Laden der Seite abrufen
+    html += "</script>";
+
+    html += "</body></html>";
+
+    web.send(200, "text/html", html);
+}
+
+void setupWebInterface() {
+    web.on("/", handleRoot);
+    web.on("/mqtt_data", handleMqttData); // NEU: AJAX-Endpunkt
+    web.begin();
+    Serial.println("HTTP server gestartet");
+}
+
+void setup() {
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.print("Verbinde mit WLAN");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+    Serial.println("Verbunden mit WLAN!");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.println("Scanne nach WLANs in der Nähe...");
+    int n = WiFi.scanNetworks();
+    if (n == 0) {
+        Serial.println("Keine Netzwerke gefunden.");
+    } else {
+        for (int i = 0; i < n; ++i) {
+            Serial.print(i + 1);
+            Serial.print(": ");
+            Serial.print(WiFi.SSID(i));
+            Serial.print(" (RSSI: ");
+            Serial.print(WiFi.RSSI(i));
+            Serial.println(" dBm)");
+        }
+    }
+
+    mqttServer.begin();
+    Serial.printf("MQTT Broker läuft auf Port %d\n", mqttPort);
+
+    setupWebInterface();
+}
+
+// Funktion zum Senden von MQTT Publish Paketen an Client
+void sendPublish(WiFiClient &client, const String &topic, const String &payload, uint8_t qos = 0, bool retain = false, uint16_t packetId = 0) {
+    if (!client.connected()) {
+        Serial.println("Error: Tried to send PUBLISH to disconnected client.");
+        return;
+    }
+
+    int len = topic.length();
+    int payloadLen = payload.length();
+
+    // Fixed header: Packet Type (PUBLISH) + Flags (QoS, Retain)
+    uint8_t fixedHeader = 0x30; // PUBLISH (0b0011)
+    fixedHeader |= (qos << 1);  // QoS bits
+    if (retain) fixedHeader |= 0x01; // Retain bit
+
+    // Remaining length calculation
+    int remLen = 2 + len + payloadLen; // 2 bytes for topic length, topic, payload
+    if (qos > 0) {
+        remLen += 2; // 2 bytes for Packet Identifier
+    }
+
+    // Variable byte integer encoding for Remaining Length (up to 4 bytes)
+    uint8_t encodedRemLen[4];
+    int i = 0;
+    do {
+        uint8_t digit = remLen % 128;
+        remLen /= 128;
+        if (remLen > 0) {
+            digit |= 0x80;
+        }
+        encodedRemLen[i++] = digit;
+    } while (remLen > 0);
+
+    client.write(fixedHeader);
+    for (int j = 0; j < i; ++j) {
+        client.write(encodedRemLen[j]);
+    }
+
+    // Topic length MSB + LSB
+    client.write((len >> 8) & 0xFF);
+    client.write(len & 0xFF);
+
+    // Topic
+    client.print(topic);
+
+    // Packet Identifier (if QoS > 0)
+    if (qos > 0) {
+        client.write((packetId >> 8) & 0xFF);
+        client.write(packetId & 0xFF);
+    }
+
+    // Payload
+    client.print(payload);
+}
+
+// Funktion zum Verarbeiten einer eingehenden PUBLISH-Nachricht
+void handlePublish(MQTTClientState& clientState, byte header, byte remainingLength) {
+    WiFiClient& client = clientState.client; // Get client reference from state
+    uint8_t qos = (header >> 1) & 0x03; // Bits 1 and 2
+    bool retain = (header & 0x01);      // Bit 0
+
+    if (!waitForBytes(client, remainingLength)) {
+        Serial.println("Timeout bei PUBLISH Payload");
+        return;
+    }
+
+    byte topicLenMsb = client.read();
+    byte topicLenLsb = client.read();
+    int topicLen = (topicLenMsb << 8) | topicLenLsb;
+
+    char topicChar[topicLen + 1];
+    for (int i = 0; i < topicLen; i++) {
+        topicChar[i] = client.read();
+    }
+    topicChar[topicLen] = 0;
+    String topic = String(topicChar);
+
+    uint16_t packetId = 0;
+    if (qos > 0) {
+        byte packetIdMsb = client.read();
+        byte packetIdLsb = client.read();
+        packetId = (packetIdMsb << 8) | packetIdLsb;
+    }
+
+    // Remaining bytes are payload
+    int payloadLen = remainingLength - (2 + topicLen);
+    if (qos > 0) payloadLen -= 2; // Account for Packet Identifier if QoS > 0
+
+    // Read payload
+    String payload = "";
+    if (payloadLen > 0) {
+        char payloadChar[payloadLen + 1];
+        for (int i = 0; i < payloadLen; i++) {
+            payloadChar[i] = client.read();
+        }
+        payloadChar[payloadLen] = 0;
+        payload = String(payloadChar);
+    }
+
+    Serial.printf("PUBLISH empfangen: Topic='%s', Payload='%s', QoS=%d, Retain=%d\n", topic.c_str(), payload.c_str(), qos, retain);
+
+    // Log message for web interface
+    Message msg = {topic, payload, millis()}; // NEU: Zeitstempel hinzufügen
+    messageLog.push_back(msg);
+    if (messageLog.size() > 50) { // Keep log size reasonable
+        messageLog.erase(messageLog.begin());
+    }
+
+    // Handle Retained Messages
+    if (retain) {
+        if (payload.length() == 0) {
+            retainedMessages.erase(topic); // Clear retained message if payload is empty
+            Serial.printf("Retained message for topic '%s' cleared.\n", topic.c_str());
+        } else {
+            retainedMessages[topic] = payload;
+            Serial.printf("Retained message for topic '%s' updated.\n", topic.c_str());
+        }
+    }
+
+    // Forward to subscribers
+    // Iterate through all currently active subscribers
+    for (auto &sub : activeSubscriptions) {
+        if (sub.clientState->client.connected() && topicMatches(topic, sub.topicFilter)) {
+            Serial.printf("Weiterleiten an Subscriber '%s' für Topic: %s\n", sub.clientState->clientId.c_str(), sub.topicFilter.c_str());
+            // Hier könnte man QoS des Abonnements beachten, senden wir vorerst mit QoS 0
+            sendPublish(sub.clientState->client, topic, payload, 0, retain);
+        }
+    }
+
+    // Send PUBACK for QoS 1
+    if (qos == 1) {
+        byte puback[] = {0x40, 0x02, (byte)(packetId >> 8), (byte)(packetId & 0xFF)};
+        client.write(puback, sizeof(puback));
+        Serial.printf("PUBACK gesendet für Packet ID %d\n", packetId);
+    }
+    // TODO: Handle QoS 2 (PUBREC, PUBREL, PUBCOMP)
+}
+
+void handleSubscribe(MQTTClientState& clientState, byte header, byte remainingLength) {
+    WiFiClient& client = clientState.client; // Get client reference from state
+
+    if (!waitForBytes(client, remainingLength)) {
+        Serial.println("Timeout bei SUBSCRIBE Payload");
+        return;
+    }
+
+    byte packetIdMsb = client.read();
+    byte packetIdLsb = client.read();
+    int packetId = (packetIdMsb << 8) | packetIdLsb;
+
+    // Könnte mehrere Topics enthalten, hier nur das erste behandeln
+    byte topicLenMsb = client.read();
+    byte topicLenLsb = client.read();
+    int topicLen = (topicLenMsb << 8) | topicLenLsb;
+
+    char topicChar[topicLen + 1];
+    for (int i = 0; i < topicLen; i++) {
+        topicChar[i] = client.read();
+    }
+    topicChar[topicLen] = 0;
+    String topic = String(topicChar);
+
+    byte qos = client.read(); // Requested QoS
+
+    Serial.printf("Client '%s' SUBSCRIBEd to Topic: %s with QoS %d\n", clientState.clientId.c_str(), topic.c_str(), qos);
+
+    // Antwort: SUBACK
+    byte suback[] = {0x90, 0x03, packetIdMsb, packetIdLsb, qos}; // Return granted QoS (here, same as requested)
+    client.write(suback, sizeof(suback));
+    Serial.println("SUBACK gesendet");
+
+    // Add to active subscriptions and client's own subscribed topics
+    ActiveSubscription newSub;
+    newSub.clientState = &clientState;
+    newSub.topicFilter = topic;
+    activeSubscriptions.push_back(newSub);
+    clientState.subscribedTopics.push_back(topic);
+
+    // Send retained messages to new subscriber
+    for (auto const& [retainedTopic, retainedPayload] : retainedMessages) {
+        if (topicMatches(retainedTopic, topic)) {
+            Serial.printf("Sende Retained Message für Topic '%s' an neuen Subscriber '%s'.\n", retainedTopic.c_str(), clientState.clientId.c_str());
+            sendPublish(client, retainedTopic, retainedPayload, 0, true); // QoS 0 for simplicity
+        }
+    }
+}
+
+void handlePingReq(MQTTClientState& clientState) {
+    WiFiClient& client = clientState.client; // Get client reference from state
+    byte pingresp[] = {0xD0, 0x00};
+    client.write(pingresp, sizeof(pingresp));
+    Serial.printf("PINGRESP gesendet an Client '%s'\n", clientState.clientId.c_str());
+    clientState.lastSeen = millis(); // Update lastSeen for the client
+}
+
+
+// Neue Funktion: Verarbeitet Daten von einem einzelnen Client nicht-blockierend
+void processMQTTClient(MQTTClientState& clientState) {
+    WiFiClient& client = clientState.client;
+
+    if (!client.connected()) {
+        return; // Client ist bereits getrennt, wird später aus der Liste entfernt
+    }
+
+    clientState.lastSeen = millis(); // Update last seen for active clients
+
+    if (!clientState.connectedACKSent) {
+        // This client has just connected and we need to process its CONNECT packet
+        if (!waitForBytes(client, 2)) {
+            // Still waiting for header, or timeout. Keep connection open for now.
+            return;
+        }
+
+        byte header = client.read();
+        byte remainingLength = client.read();
+
+        if (header != 0x10) { // Not a CONNECT packet as expected
+            Serial.printf("Client '%s' sent non-CONNECT first: 0x%X. Disconnecting.\n", clientState.clientId.c_str(), header);
+            client.stop();
+            return;
+        }
+
+        if (!waitForBytes(client, remainingLength)) {
+            Serial.printf("Timeout processing CONNECT payload for client '%s'. Disconnecting.\n", clientState.clientId.c_str());
+            client.stop();
+            return;
+        }
+
+        // Parse CONNECT packet (simplified, similar to your original handleClient)
+        for (int i = 0; i < 8; ++i) client.read(); // Skip protocol name, level, flags, keep alive
+
+        byte clientIdLenHi = client.read();
+        byte clientIdLenLo = client.read();
+        int clientIdLen = (clientIdLenHi << 8) | clientIdLenLo;
+
+        char clientId[clientIdLen + 1];
+        for (int i = 0; i < clientIdLen; i++) {
+            clientId[i] = client.read();
+        }
+        clientId[clientIdLen] = 0;
+        clientState.clientId = String(clientId);
+
+        Serial.printf("Client '%s' CONNECTED. Sending CONNACK.\n", clientState.clientId.c_str());
+
+        // CONNACK
+        byte connack[] = {0x20, 0x02, 0x00, 0x00}; // Session Present = 0, Connect Acknowledge = Accepted
+        client.write(connack, sizeof(connack));
+        clientState.connectedACKSent = true; // Mark as acknowledged
+    }
+
+    // Process other MQTT packets for this connected client
+    if (client.available() >= 2) {
+      byte h = client.read();
+      byte len = client.read();
+
+      int packetType = h >> 4;
+
+      switch (packetType) {
+        case 3: // PUBLISH
+          handlePublish(clientState, h, len); // Pass clientState by reference
+          break;
+        case 8: // SUBSCRIBE
+          handleSubscribe(clientState, h, len); // Pass clientState by reference
+          break;
+        case 12: // PINGREQ
+            handlePingReq(clientState); // Pass clientState by reference
+            break;
+        case 14: // DISCONNECT
+            Serial.printf("Client '%s' DISCONNECT requested. Closing connection.\n", clientState.clientId.c_str());
+            client.stop(); // Gracefully stop
+            break;
+        default:
+          Serial.printf("Client '%s': Unknown packet type 0x%X, length %d. Disconnecting.\n", clientState.clientId.c_str(), packetType, len);
+          for (int i = 0; i < len && client.available(); ++i) client.read(); // Consume bytes
+          client.stop();
+          break;
+      }
+    }
+}
+
+void loop() {
+    // 1. Webserver Anfragen verarbeiten (nicht blockierend)
+    web.handleClient();
+
+    // 2. Neue MQTT-Client Verbindungen akzeptieren
+    WiFiClient newClient = mqttServer.available();
+    if (newClient) {
+        Serial.println("Neue TCP-Verbindung erkannt.");
+        MQTTClientState newState;
+        newState.client = newClient; // WiFiClient ist kopierbar in diesem Kontext (shallow copy)
+        newState.lastSeen = millis();
+        // connectedACKSent ist standardmäßig false
+        connectedMQTTClients.push_back(newState);
+        Serial.printf("Anzahl verbundener MQTT-Clients: %d\n", connectedMQTTClients.size());
+    }
+
+    // 3. Bestehende MQTT-Client-Verbindungen verarbeiten
+    // Iteriere rückwärts, um sichere Entfernung zu ermöglichen
+    for (int i = connectedMQTTClients.size() - 1; i >= 0; --i) {
+        if (connectedMQTTClients[i].client.connected()) {
+            processMQTTClient(connectedMQTTClients[i]);
+        } else {
+            // Client hat die Verbindung getrennt, entferne ihn
+            Serial.printf("Client '%s' (%s) hat die Verbindung getrennt. Entferne ihn.\n",
+                            connectedMQTTClients[i].clientId.c_str(),
+                            connectedMQTTClients[i].client.remoteIP().toString().c_str());
+
+            // Remove subscriptions for this client
+            activeSubscriptions.erase(std::remove_if(activeSubscriptions.begin(), activeSubscriptions.end(),
+                                                     [&](const ActiveSubscription& sub) {
+                                                         return sub.clientState == &connectedMQTTClients[i];
+                                                     }),
+                                     activeSubscriptions.end());
+
+            connectedMQTTClients.erase(connectedMQTTClients.begin() + i);
+        }
+    }
+
+    // 4. Keep-Alive / Timeout Prüfungen (Optional, aber empfohlen)
+    // Dies müsste eine separate Funktion sein, die über alle clients iteriert
+    // und prüft, ob lastSeen + keepAliveTimeout überschritten wurde.
+    // if (millis() - clientState.lastSeen > KEEP_ALIVE_TIMEOUT) { client.stop(); }
+}

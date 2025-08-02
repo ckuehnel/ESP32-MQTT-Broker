@@ -1,0 +1,496 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <vector>
+#include <map>
+
+// WLAN Parameter
+const char* ssid = "FRITZ!Box 7590 RI";
+const char* password = "52261156805385776967";
+
+const int mqttPort = 1883;
+WiFiServer mqttServer(mqttPort);
+WebServer web(80);
+
+struct Subscriber {
+  WiFiClient client; // Die Referenz zum Client
+  String topic;
+  // Optional: QoS Level des Abonnements, Packet ID (für QoS 1/2)
+};
+
+struct ClientInfo {
+  String clientId;
+  unsigned long lastSeen;
+  String willTopic;
+  String willMessage;
+  bool hasLWT;
+  // Hier könnten weitere Infos zum Client gespeichert werden
+};
+
+std::vector<Subscriber> subscribers;
+std::map<String, String> retainedMessages;
+// Die Clients sollten am besten in einer Map oder einem Vector verwaltet werden,
+// um ihre Verbindung und Infos zu speichern.
+// Hier speichern wir die ClientInfo direkt mit dem WiFiClient* als Schlüssel
+std::map<WiFiClient*, ClientInfo> connectedClients;
+
+
+struct Message {
+  String topic;
+  String payload;
+};
+std::vector<Message> messageLog;    // Für Webinterface
+
+// Hilfsfunktion: Warte auf bestimmte Anzahl Bytes im Client
+bool waitForBytes(WiFiClient& client, int length, unsigned long timeout = 1000) {
+  unsigned long start = millis();
+  while (client.available() < length) {
+    if (millis() - start > timeout) return false;
+    delay(1);
+  }
+  return true;
+}
+
+// Hilfsfunktion: Zerlegt ein Topic in seine Segmente
+std::vector<String> splitTopic(const String& topic) {
+  std::vector<String> parts;
+  int start = 0;
+  int idx = topic.indexOf('/', start);
+  while (idx != -1) {
+    parts.push_back(topic.substring(start, idx));
+    start = idx + 1;
+    idx = topic.indexOf('/', start);
+  }
+  parts.push_back(topic.substring(start));
+  return parts;
+}
+
+// Hilfsfunktion: Überprüft, ob ein Topic mit einem Filter übereinstimmt (für Wildcards)
+// Einfache Implementierung für '+' und '#' am Ende
+bool topicMatches(const String& topic, const String& filter) {
+  if (filter == "#") return true; // Alles unterhalb des Root-Levels
+
+  std::vector<String> topicParts = splitTopic(topic);
+  std::vector<String> filterParts = splitTopic(filter);
+
+  // Fall: '#'-Wildcard am Ende
+  if (filterParts.size() > 0 && filterParts.back() == "#") {
+    if (topicParts.size() >= filterParts.size() - 1) {
+      bool match = true;
+      for (size_t i = 0; i < filterParts.size() - 1; ++i) {
+        if (filterParts[i] != "+" && filterParts[i] != topicParts[i]) {
+          match = false;
+          break;
+        }
+      }
+      return match;
+    }
+  }
+
+  // Für genaue Übereinstimmungen oder '+' Wildcards (nicht am Ende '#')
+  if (topicParts.size() != filterParts.size()) return false;
+
+  for (size_t i = 0; i < topicParts.size(); ++i) {
+    if (filterParts[i] == "+") continue;
+    if (topicParts[i] != filterParts[i]) return false;
+  }
+  return true;
+}
+
+
+// Webinterface HTML Seite
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 MQTT Broker</title>";
+  html += "<style>body{font-family:Arial;margin:20px;}table{border-collapse:collapse;width:100%;}";
+  html += "th,td{border:1px solid #ccc;padding:8px;text-align:left;}</style></head><body>";
+  html += "<h1>MQTT Nachrichten Log</h1>";
+  html += "<table><tr><th>Topic</th><th>Payload</th></tr>";
+
+  for (auto &msg : messageLog) {
+    html += "<tr><td>" + msg.topic + "</td><td>" + msg.payload + "</td></tr>";
+  }
+  html += "</table>";
+
+  html += "<h2>Retained Messages</h2><table><tr><th>Topic</th><th>Payload</th></tr>";
+  for (auto const& [topic, payload] : retainedMessages) {
+      html += "<tr><td>" + topic + "</td><td>" + payload + "</td></tr>";
+  }
+  html += "</table>";
+
+  html += "<h2>WLAN Netzwerke in der Nähe</h2><ul>";
+
+  int n = WiFi.scanComplete();
+  if (n == -2) {
+    WiFi.scanNetworks(true);    // Starte Scan neu
+    html += "<li>Scan läuft...</li>";
+  } else if (n == 0) {
+    html += "<li>Keine Netzwerke gefunden</li>";
+  } else if (n > 0) {
+    for (int i = 0; i < n; ++i) {
+      html += "<li>" + WiFi.SSID(i) + " (RSSI: " + String(WiFi.RSSI(i)) + " dBm)</li>";
+    }
+    WiFi.scanDelete();
+    // WiFi.scanNetworks(true); // Nicht jedes Mal neu scannen
+  }
+
+  html += "</ul>";
+
+  html += "<p>Verbunden mit: " + String(ssid) + "<br>IP-Adresse: " + WiFi.localIP().toString() + "</p>";
+  html += "</body></html>";
+
+  web.send(200, "text/html", html);
+}
+
+void setupWebInterface() {
+  web.on("/", handleRoot);
+  web.begin();
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Verbinde mit WLAN");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("Verbunden mit WLAN!");
+  Serial.print("IP-Adresse: ");
+  Serial.println(WiFi.localIP());
+
+Serial.println("Scanne nach WLANs in der Nähe...");
+int n = WiFi.scanNetworks();
+if (n == 0) {
+  Serial.println("Keine Netzwerke gefunden.");
+} else {
+  for (int i = 0; i < n; ++i) {
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(WiFi.SSID(i));
+    Serial.print(" (RSSI: ");
+    Serial.print(WiFi.RSSI(i));
+    Serial.println(" dBm)");
+  }
+}
+
+  mqttServer.begin();
+  Serial.printf("MQTT Broker läuft auf Port %d\n", mqttPort);
+
+  setupWebInterface();
+}
+
+// Funktion zum Senden von MQTT Publish Paketen an Client
+void sendPublish(WiFiClient &client, const String &topic, const String &payload, uint8_t qos = 0, bool retain = false, uint16_t packetId = 0) {
+  int len = topic.length();
+  int payloadLen = payload.length();
+
+  // Fixed header: Packet Type (PUBLISH) + Flags (QoS, Retain)
+  uint8_t fixedHeader = 0x30; // PUBLISH (0b0011)
+  fixedHeader |= (qos << 1);  // QoS bits
+  if (retain) fixedHeader |= 0x01; // Retain bit
+
+  // Remaining length calculation
+  int remLen = 2 + len + payloadLen; // 2 bytes for topic length, topic, payload
+  if (qos > 0) {
+      remLen += 2; // 2 bytes for Packet Identifier
+  }
+
+  // Variable byte integer encoding for Remaining Length (up to 4 bytes)
+  // This is a simplified version for typical small messages
+  uint8_t encodedRemLen[4];
+  int i = 0;
+  do {
+      uint8_t digit = remLen % 128;
+      remLen /= 128;
+      if (remLen > 0) {
+          digit |= 0x80;
+      }
+      encodedRemLen[i++] = digit;
+  } while (remLen > 0);
+
+  client.write(fixedHeader);
+  for (int j = 0; j < i; ++j) {
+      client.write(encodedRemLen[j]);
+  }
+
+  // Topic length MSB + LSB
+  client.write((len >> 8) & 0xFF);
+  client.write(len & 0xFF);
+
+  // Topic
+  client.print(topic);
+
+  // Packet Identifier (if QoS > 0)
+  if (qos > 0) {
+      client.write((packetId >> 8) & 0xFF);
+      client.write(packetId & 0xFF);
+  }
+
+  // Payload
+  client.print(payload);
+}
+
+// Funktion zum Verarbeiten einer eingehenden PUBLISH-Nachricht
+void handlePublish(WiFiClient &client, byte header, byte remainingLength) {
+  uint8_t qos = (header >> 1) & 0x03; // Bits 1 and 2
+  bool retain = (header & 0x01);     // Bit 0
+
+  if (!waitForBytes(client, remainingLength)) {
+    Serial.println("Timeout bei PUBLISH Payload");
+    return;
+  }
+
+  byte topicLenMsb = client.read();
+  byte topicLenLsb = client.read();
+  int topicLen = (topicLenMsb << 8) | topicLenLsb;
+
+  char topicChar[topicLen + 1];
+  for (int i = 0; i < topicLen; i++) {
+    topicChar[i] = client.read();
+  }
+  topicChar[topicLen] = 0;
+  String topic = String(topicChar);
+
+  uint16_t packetId = 0;
+  if (qos > 0) {
+      byte packetIdMsb = client.read();
+      byte packetIdLsb = client.read();
+      packetId = (packetIdMsb << 8) | packetIdLsb;
+  }
+
+  // Remaining bytes are payload
+  int payloadLen = remainingLength - (2 + topicLen);
+  if (qos > 0) payloadLen -= 2; // Account for Packet Identifier if QoS > 0
+
+  char payloadChar[payloadLen + 1];
+  for (int i = 0; i < payloadLen; i++) {
+    payloadChar[i] = client.read();
+  }
+  payloadChar[payloadLen] = 0;
+  String payload = String(payloadChar);
+
+  Serial.printf("PUBLISH empfangen: Topic='%s', Payload='%s', QoS=%d, Retain=%d\n", topic.c_str(), payload.c_str(), qos, retain);
+
+  // Log message for web interface
+  Message msg = {topic, payload};
+  messageLog.push_back(msg);
+  if (messageLog.size() > 50) { // Keep log size reasonable
+      messageLog.erase(messageLog.begin());
+  }
+
+  // Handle Retained Messages
+  if (retain) {
+      if (payload.length() == 0) {
+          retainedMessages.erase(topic); // Clear retained message if payload is empty
+          Serial.printf("Retained message for topic '%s' cleared.\n", topic.c_str());
+      } else {
+          retainedMessages[topic] = payload;
+          Serial.printf("Retained message for topic '%s' updated.\n", topic.c_str());
+      }
+  }
+
+  // Forward to subscribers
+  // Achtung: Iterieren über std::vector<Subscriber> während des Sendens kann zu Problemen führen,
+  // wenn Clients sich währenddessen trennen. Hier ist eine Kopie des Vectors sicherer.
+  // In einer echten Implementierung sollte man defekte Clients aus der Liste entfernen.
+  for (auto &sub : subscribers) {
+    if (sub.client.connected() && topicMatches(topic, sub.topic)) {
+      Serial.printf("Weiterleiten an Subscriber für Topic: %s\n", sub.topic.c_str());
+      // Hier könnte man QoS des Abonnements beachten, senden wir vorerst mit QoS 0
+      sendPublish(sub.client, topic, payload, 0, retain);
+    }
+  }
+
+  // Send PUBACK for QoS 1
+  if (qos == 1) {
+      byte puback[] = {0x40, 0x02, (byte)(packetId >> 8), (byte)(packetId & 0xFF)};
+      client.write(puback, sizeof(puback));
+      Serial.printf("PUBACK gesendet für Packet ID %d\n", packetId);
+  }
+  // TODO: Handle QoS 2 (PUBREC, PUBREL, PUBCOMP)
+}
+
+void handleSubscribe(WiFiClient &client, byte header, byte remainingLength) {
+    if (!waitForBytes(client, remainingLength)) {
+        Serial.println("Timeout bei SUBSCRIBE Payload");
+        return;
+    }
+
+    byte packetIdMsb = client.read();
+    byte packetIdLsb = client.read();
+    int packetId = (packetIdMsb << 8) | packetIdLsb;
+
+    // Könnte mehrere Topics enthalten, hier nur das erste behandeln
+    byte topicLenMsb = client.read();
+    byte topicLenLsb = client.read();
+    int topicLen = (topicLenMsb << 8) | topicLenLsb;
+
+    char topicChar[topicLen + 1];
+    for (int i = 0; i < topicLen; i++) {
+        topicChar[i] = client.read();
+    }
+    topicChar[topicLen] = 0;
+    String topic = String(topicChar);
+
+    byte qos = client.read(); // Requested QoS
+
+    Serial.print("SUBSCRIBE auf Topic: ");
+    Serial.print(topic);
+    Serial.print(" mit QoS ");
+    Serial.println(qos);
+
+    // Antwort: SUBACK
+    byte suback[] = {0x90, 0x03, packetIdMsb, packetIdLsb, qos}; // Return granted QoS (here, same as requested)
+    client.write(suback, sizeof(suback));
+    Serial.println("SUBACK gesendet");
+
+    // Speichern für spätere PUBLISH
+    Subscriber s;
+    s.client = client;
+    s.topic = String(topic);
+    subscribers.push_back(s);
+
+    // Send retained messages to new subscriber
+    for (auto const& [retainedTopic, retainedPayload] : retainedMessages) {
+        if (topicMatches(retainedTopic, topic)) {
+            Serial.printf("Sende Retained Message für Topic '%s' an neuen Subscriber.\n", retainedTopic.c_str());
+            sendPublish(client, retainedTopic, retainedPayload, 0, true); // QoS 0 for simplicity
+        }
+    }
+}
+
+void handlePingReq(WiFiClient &client) {
+    byte pingresp[] = {0xD0, 0x00};
+    client.write(pingresp, sizeof(pingresp));
+    Serial.println("PINGRESP gesendet");
+    // Update lastSeen for the client
+    if (connectedClients.count(&client)) {
+        connectedClients[&client].lastSeen = millis();
+    }
+}
+
+
+void handleClient(WiFiClient client) {
+  Serial.println("Neuer Client verbunden");
+  // The &client in the map key stores the memory address of the local 'client' object.
+  // This is problematic because 'client' is a local variable that will be destroyed
+  // when handleClient exits. The pointer will become dangling.
+  // Instead, you need to store the WiFiClient object itself, or ensure its lifetime
+  // is managed (e.g., in a vector of WiFiClient objects).
+  // For a broker handling multiple clients, you typically store the WiFiClient objects
+  // in a list/vector and iterate over them in loop().
+  // For this blocking example, we'll keep it simple for the error fix.
+  // Remove the problematic line: connectedClients[&client] = ClientInfo(); // Dummy init
+
+  if (!waitForBytes(client, 2)) {
+    Serial.println("Timeout bei Header");
+    client.stop();
+    return;
+  }
+
+  byte header = client.read();
+  byte remainingLength = client.read();
+
+  if (header != 0x10) { // CONNECT
+    Serial.print("Kein CONNECT: 0x");
+    Serial.println(header, HEX);
+    client.stop();
+    return;
+  }
+
+  // CONNECT packet parsing
+  if (!waitForBytes(client, remainingLength)) {
+    Serial.println("Timeout bei CONNECT payload");
+    client.stop();
+    return;
+  }
+
+  // Read Protocol Name (MQTT), Protocol Level (4), Connect Flags, Keep Alive
+  for (int i = 0; i < 8; ++i) client.read(); // Skip fixed part
+
+  byte clientIdLenHi = client.read();
+  byte clientIdLenLo = client.read();
+  int clientIdLen = (clientIdLenHi << 8) | clientIdLenLo;
+
+  char clientId[clientIdLen + 1];
+  for (int i = 0; i < clientIdLen; i++) {
+    clientId[i] = client.read();
+  }
+  clientId[clientIdLen] = 0;
+  String clientID_str = String(clientId);
+
+  Serial.print("Client ID: ");
+  Serial.println(clientID_str);
+
+  // CONNACK
+  byte connack[] = {0x20, 0x02, 0x00, 0x00}; // Session Present = 0, Connect Acknowledge = Accepted
+  client.write(connack, sizeof(connack));
+  Serial.println("CONNACK gesendet");
+
+  // Store client info (This clientInfo is local to this connection, not globally managed yet)
+  // For proper management of multiple concurrent clients, you would need a different approach
+  // than this blocking handleClient function.
+  ClientInfo currentClientInfo;
+  currentClientInfo.clientId = clientID_str;
+  currentClientInfo.lastSeen = millis();
+  currentClientInfo.hasLWT = false; // Implement LWT parsing if needed
+
+  // Main loop for this client
+  while (client.connected()) {
+    // Update lastSeen for this client
+    currentClientInfo.lastSeen = millis();
+
+    // Check if client has data available (non-blocking)
+    if (client.available() >= 2) {
+      byte h = client.read();
+      byte len = client.read(); // Only single-byte remaining length for simplicity
+
+      int packetType = h >> 4; // Extract packet type (bits 4-7)
+
+      switch (packetType) {
+        case 3: // PUBLISH
+          handlePublish(client, h, len);
+          break;
+        case 8: // SUBSCRIBE
+          handleSubscribe(client, h, len);
+          break;
+        case 12: // PINGREQ
+            handlePingReq(client);
+            break;
+        case 14: // DISCONNECT
+            Serial.printf("Client '%s' DISCONNECT\n", currentClientInfo.clientId.c_str());
+            client.stop(); // Gracefully stop
+            break;
+        default:
+          Serial.printf("Unbekanntes Paket empfangen: Typ 0x%X, Len %d. Trenne Verbindung.\n", packetType, len);
+          // Consume remaining bytes to prevent issues if not stopping immediately
+          for (int i = 0; i < len && client.available(); ++i) client.read();
+          client.stop();
+          break;
+      }
+    }
+    delay(1); // Give time for other tasks
+  }
+
+  // Client disconnected
+  Serial.printf("Client '%s' getrennt\n", currentClientInfo.clientId.c_str());
+  // Remove from subscribers list
+  // CORRECTED LINE: Removed 'const' from 'Subscriber& s'
+  subscribers.erase(std::remove_if(subscribers.begin(), subscribers.end(),
+                                   [&client](Subscriber& s) { return s.client == client; }),
+                    subscribers.end());
+  // The 'connectedClients' map needs to be managed differently if handleClient is blocking.
+  // In a non-blocking scenario, you'd iterate the map in loop() and remove disconnected clients.
+  // For this blocking example, currentClientInfo is a local variable, so no global removal is needed here.
+}
+
+void loop() {
+  WiFiClient client = mqttServer.available();
+  if (client) {
+    handleClient(client); // This call blocks until the client disconnects or times out
+  }
+
+  web.handleClient();
+  // checkKeepAlive(); // This would need to run non-blockingly or in a separate task
+}
