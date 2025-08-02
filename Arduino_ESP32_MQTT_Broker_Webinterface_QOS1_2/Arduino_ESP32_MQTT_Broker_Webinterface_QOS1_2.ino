@@ -16,6 +16,8 @@
 //
 // Hinweis: Die ArduinoJson-Bibliothek muss über den Bibliotheksmanager der Arduino IDE
 //          installiert werden (Suchen Sie nach "ArduinoJson").
+//
+// created by Josef Bernhardt 2025-07-31 josef@bernhardt.de
 // =================================================================================================
 #include <WiFi.h>
 #include <WebServer.h>
