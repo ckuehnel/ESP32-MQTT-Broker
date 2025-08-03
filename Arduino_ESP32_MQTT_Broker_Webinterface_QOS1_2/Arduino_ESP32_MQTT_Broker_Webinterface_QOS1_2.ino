@@ -35,7 +35,7 @@
 
 // WLAN Parameter
 const char* ssid = "Sunrise_2.4GHz_19B4C2";
-const char* password = "u2u7fgzv31Ds";
+const char* password = "u2uxxxxxxx1Ds";
 
 const int mqttPort = 1883;
 WiFiServer mqttServer(mqttPort);
