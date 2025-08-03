@@ -1,103 +1,71 @@
 // =================================================================================================
 // ESP32 MQTT Broker mit integriertem Webinterface und AJAX-Datenaktualisierung
 // =================================================================================================
-// Dieses Programm verwandelt einen ESP32 in einen einfachen MQTT-Broker, der es IoT-Geräten
-// ermöglicht, über das MQTT-Protokoll zu kommunizieren. Zusätzlich bietet es ein Webinterface,
+// Dieses Programm verwandelt einen ESP32 in einen einfachen MQTT-Broker, der es IoT-Geraeten
+// ermöglicht, ueber das MQTT-Protokoll zu kommunizieren. Zusaetzlich bietet es ein Webinterface,
 // das den Status des Brokers, empfangene Nachrichten und verbundene Clients in Echtzeit anzeigt.
-// Die Datenaktualisierung im Webinterface erfolgt dynamisch über AJAX.
+// Die Datenaktualisierung im Webinterface erfolgt dynamisch ueber AJAX.
 //
 // Bibliotheken:
-// - WiFi.h: Für die WLAN-Konnektivität des ESP32.
+// - WiFi.h: fuer die WLAN-Konnektivitaet des ESP32.
 // - WebServer.h: Zum Erstellen eines HTTP-Webservers auf dem ESP32.
-// - vector: Für dynamische Arrays (z.B. Client-Listen, Topic-Teile).
-// - map: Für Key-Value-Paare (z.B. Retained Messages).
-// - algorithm: Für Algorithmen wie std::remove_if zum Entfernen von Elementen aus Vektoren.
-// - ArduinoJson.h: Zum Serialisieren von Daten in das JSON-Format für das Webinterface.
+// - vector: fuer dynamische Arrays (z.B. Client-Listen, Topic-Teile).
+// - map: fuer Key-Value-Paare (z.B. Retained Messages).
+// - algorithm: fuer Algorithmen wie std::remove_if zum Entfernen von Elementen aus Vektoren.
+// - ArduinoJson.h: Zum Serialisieren von Daten in das JSON-Format fuer das Webinterface.
 //
-// Hinweis: Die ArduinoJson-Bibliothek muss über den Bibliotheksmanager der Arduino IDE
+// Hinweis: Die ArduinoJson-Bibliothek muss ueber den Bibliotheksmanager der Arduino IDE
 //          installiert werden (Suchen Sie nach "ArduinoJson").
+//          Die ArduinoSTL-Bibliothek muss ebenfalls über den Bibliotheksmanager der Arduino IDE
+//          installiert werden (Standard C++ for Arduino” von Michael C. Morris oder 
+//          eine ähnliche STL-Portierung) wird für die Includes vector, map und algorithm benötigt.
 //
-// created by Josef Bernhardt 2025-07-31 josef@bernhardt.de
+// Autor:  Josef Bernhardt www.bernhardt.de
+//
+// Hardware: ESP32 DEV Modul
+//
+// Letzte Änderung: 01.08.2025
 // =================================================================================================
 #include <WiFi.h>
 #include <WebServer.h>
-#include <vector>
+#include <vector>        // V.1.3.3
 #include <map>
 #include <algorithm>
-#include <ArduinoJson.h>
+#include <ArduinoJson.h> // V.7.4.2
 
 // WLAN Parameter
-const char* ssid = "FRITZ!Box 7590 RI";
-const char* password = "53267156905389775977";
+const char* ssid = "Sunrise_2.4GHz_19B4C2";
+const char* password = "u2u7fgzv31Ds";
 
 const int mqttPort = 1883;
 WiFiServer mqttServer(mqttPort);
 WebServer web(80);
 
-// =================================================================================================
-// GLOBALE KONSTANTEN UND STRUKTUREN
-// =================================================================================================
-
-// Timeout für QoS-Nachrichten-Retransmissionen (in Millisekunden)
-const unsigned long QoS_TIMEOUT_MS = 5000;
-// Maximale Anzahl von Wiederholungsversuchen für QoS-Nachrichten
-const int MAX_QOS_RETRIES = 3;
-
-// Struktur für das Nachrichten-Log im Webinterface
+// Struktur für geloggte Nachrichten
 struct Message {
     String topic;
     String payload;
     unsigned long timestamp;
 };
 
-// Struktur zur Verfolgung von ausgehenden QoS 1/2 Nachrichten
-struct OutgoingMessage {
-    String topic;
-    String payload;
-    uint8_t qos;
-    bool retain;
-    uint16_t packetId;
-    unsigned long timestampSent; // Zeitpunkt des letzten Sendens
-    uint8_t retryCount;          // Anzahl der Wiederholungsversuche
-    uint8_t state;               // 0: PUBLISH gesendet, 1: PUBREC gesendet (nur für QoS 2)
-};
-
-// Struktur zur Verfolgung von eingehenden QoS 2 Nachrichten
-struct IncomingQoS2State {
-    String topic;
-    String payload;
-    uint8_t qos; // QoS des eingehenden PUBLISH
-    uint16_t packetId;
-    unsigned long timestampReceived; // Zeitpunkt des Empfangs des PUBLISH
-    uint8_t state;                   // 0: PUBLISH empfangen, 1: PUBREC gesendet, 2: PUBREL empfangen
-};
-
-// Struktur für den Zustand jedes verbundenen MQTT-Clients
+// Struktur für den Zustand eines verbundenen MQTT-Clients
 struct MQTTClientState {
     WiFiClient client;
     String clientId;
-    unsigned long lastSeen; // Letzter Zeitpunkt der Client-Aktivität (für Keep-Alive)
+    unsigned long lastSeen;
     String willTopic;
     String willMessage;
     bool hasLWT;
-    bool connectedACKSent = false; // Flag, ob CONNACK bereits gesendet wurde
-    std::vector<String> subscribedTopics; // Liste der abonnierten Topics
-    uint16_t clientKeepAliveSec = 0; // Keep-Alive-Intervall vom Client (in Sekunden)
-
-    // QoS-spezifische Zustände
-    std::map<uint16_t, OutgoingMessage> outgoingQoSMessages; // Nachrichten, die vom Broker an diesen Client gesendet wurden und auf Bestätigung warten
-    std::map<uint16_t, IncomingQoS2State> incomingQoS2Messages; // Nachrichten, die von diesem Client mit QoS 2 empfangen wurden und auf Handshake-Abschluss warten
-    uint16_t nextOutgoingPacketId = 1; // Zähler für Packet IDs, die dieser Broker für diesen Client vergibt (für ausgehende PUBLISH)
+    std::vector<String> subscribedTopics;
 };
 
 // Die globale Liste aller verbundenen MQTT-Clients
 std::vector<MQTTClientState> connectedMQTTClients;
 
-// Die Struktur für Abonnements, die jetzt auf MQTTClientState zeigt
+// Die Struktur für Abonnements
 struct ActiveSubscription {
     MQTTClientState* clientState;
     String topicFilter;
-    uint8_t qos; // Der vom Subscriber gewünschte QoS für dieses Abonnement
 };
 std::vector<ActiveSubscription> activeSubscriptions;
 
@@ -106,19 +74,42 @@ std::map<String, String> retainedMessages;
 // Log der letzten empfangenen Nachrichten für das Webinterface
 std::vector<Message> messageLog;
 
-// =================================================================================================
-// HILFSFUNKTIONEN
-// =================================================================================================
+// Struktur zur Speicherung von QoS 2 Nachrichten
+struct QoS2Message {
+    String topic;
+    String payload;
+};
+std::map<String, QoS2Message> pendingQoS2;
+
 
 // Hilfsfunktion: Warte auf bestimmte Anzahl Bytes im Client
 bool waitForBytes(WiFiClient& client, int length, unsigned long timeout = 1000) {
     unsigned long start = millis();
     while (client.available() < length) {
-        if (!client.connected()) return false; // Client disconnected while waiting
-        if (millis() - start > timeout) return false;
+        if (millis() - start > timeout) {
+            Serial.printf("Timeout: Erwartete %d Bytes, aber nur %d verfuegbar.\n", length, client.available());
+            return false;
+        }
         delay(1);
     }
     return true;
+}
+
+// Hilfsfunktion: Variable Remaining Length decodieren
+int decodeRemainingLength(WiFiClient& client) {
+    int multiplier = 1;
+    int value = 0;
+    uint8_t encodedByte;
+    do {
+        if (!waitForBytes(client, 1)) return -1;
+        encodedByte = client.read();
+        value += (encodedByte & 127) * multiplier;
+        multiplier *= 128;
+        if (multiplier > 128 * 128 * 128) {
+            return -1; // Fehler: Ungültige Remaining Length
+        }
+    } while ((encodedByte & 128) != 0);
+    return value;
 }
 
 // Hilfsfunktion: Zerlegt ein Topic in seine Segmente
@@ -135,7 +126,7 @@ std::vector<String> splitTopic(const String& topic) {
     return parts;
 }
 
-// Hilfsfunktion: Überprüft, ob ein Topic mit einem Filter übereinstimmt (für Wildcards)
+// Hilfsfunktion: überprüft, ob ein Topic mit einem Filter übereinstimmt
 bool topicMatches(const String& topic, const String& filter) {
     if (filter == "#") return true;
 
@@ -163,35 +154,155 @@ bool topicMatches(const String& topic, const String& filter) {
     return true;
 }
 
-// Funktion zum Lesen einer Längen-präfixierten String aus dem Client-Stream
-String readLengthPrefixedString(WiFiClient& client) {
-    if (!waitForBytes(client, 2)) return "";
-    byte lenMsb = client.read();
-    byte lenLsb = client.read();
-    int len = (lenMsb << 8) | lenLsb;
+// Handler für AJAX-Anfragen an /mqtt_data
+void handleMqttData() {
+    DynamicJsonDocument doc(4096);
 
-    if (len == 0) return ""; // Leere Strings sind erlaubt
-
-    if (!waitForBytes(client, len)) return ""; // Timeout beim Lesen des Strings
-
-    char* buffer = new char[len + 1];
-    for (int i = 0; i < len; i++) {
-        buffer[i] = client.read();
+    JsonArray messagesArray = doc.createNestedArray("messageLog");
+    for (auto &msg : messageLog) {
+        JsonObject msgObj = messagesArray.createNestedObject();
+        msgObj["topic"] = msg.topic;
+        msgObj["payload"] = msg.payload;
+        msgObj["timestamp"] = msg.timestamp;
     }
-    buffer[len] = '\0';
-    String result = String(buffer);
-    delete[] buffer;
-    return result;
+
+    JsonObject retainedObj = doc.createNestedObject("retainedMessages");
+    for (auto const& [topic, payload] : retainedMessages) {
+        retainedObj[topic] = payload;
+    }
+
+    JsonArray clientsArray = doc.createNestedArray("connectedClients");
+    for (auto &clientState : connectedMQTTClients) {
+        JsonObject clientObj = clientsArray.createNestedObject();
+        clientObj["id"] = clientState.clientId;
+        clientObj["lastSeen"] = millis() - clientState.lastSeen;
+        JsonArray subTopicsArray = clientObj.createNestedArray("subscribedTopics");
+        for (const String& topic : clientState.subscribedTopics) {
+            subTopicsArray.add(topic);
+        }
+    }
+
+    doc["wifi_ssid"] = String(ssid);
+    doc["wifi_ip"] = WiFi.localIP().toString();
+
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+
+    web.send(200, "application/json", jsonResponse);
 }
 
-// Funktion zum Senden eines MQTT-Pakets (generisch)
-void sendMQTTPacket(WiFiClient &client, uint8_t fixedHeader, const std::vector<byte>& variableHeaderAndPayload) {
+// Webinterface HTML Seite
+void handleRoot() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 MQTT Broker</title>";
+    html += "<style>";
+    html += "body{font-family:Arial;margin:20px;background-color:#f4f7f6;color:#333;}";
+    html += "h1,h2{color:#0056b3;}";
+    html += "table{border-collapse:collapse;width:100%;margin-bottom:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1);border-radius:8px;overflow:hidden;}";
+    html += "th,td{border:1px solid #e0e0e0;padding:12px;text-align:left;}";
+    html += "th{background-color:#e9ecef;font-weight:bold;color:#555;}";
+    html += "tr:nth-child(even){background-color:#f9f9f9;}";
+    html += "tr:hover{background-color:#e2f0ff;}";
+    html += "p{margin-top:20px;font-size:0.9em;color:#666;}";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<h1>MQTT Nachrichten Log</h1>";
+    html += "<table id='messageLogTable'><thead><tr><th>Topic</th><th>Payload</th><th>Zuletzt empfangen</th></tr></thead><tbody></tbody></table>";
+    html += "<h2>Retained Messages</h2><table id='retainedMessagesTable'><thead><tr><th>Topic</th><th>Payload</th></tr></thead><tbody></tbody></table>";
+    html += "<h2>Connected MQTT Clients</h2><table id='connectedClientsTable'><thead><tr><th>Client ID</th><th>Last Seen (ms)</th><th>Subscribed Topics</th></tr></thead><tbody></tbody></table>";
+    html += "<p>Verbunden mit: <span id='wifiSsid'></span><br>IP-Adresse: <span id='wifiIp'></span></p>";
+    html += "<script>";
+    html += "function fetchData() {";
+    html += "    var xhr = new XMLHttpRequest();";
+    html += "    xhr.onreadystatechange = function() {";
+    html += "        if (xhr.readyState == 4 && xhr.status == 200) {";
+    html += "            var data = JSON.parse(xhr.responseText);";
+    html += "            var messageLogTableBody = document.getElementById('messageLogTable').getElementsByTagName('tbody')[0];";
+    html += "            messageLogTableBody.innerHTML = '';";
+    html += "            data.messageLog.forEach(function(item) {";
+    html += "                var row = messageLogTableBody.insertRow();";
+    html += "                row.insertCell(0).innerText = item.topic;";
+    html += "                row.insertCell(1).innerText = item.payload;";
+    html += "                row.insertCell(2).innerText = new Date(item.timestamp).toLocaleTimeString();";
+    html += "            });";
+    html += "            var retainedMessagesTableBody = document.getElementById('retainedMessagesTable').getElementsByTagName('tbody')[0];";
+    html += "            retainedMessagesTableBody.innerHTML = '';";
+    html += "            for (var topic in data.retainedMessages) {";
+    html += "                if (data.retainedMessages.hasOwnProperty(topic)) {";
+    html += "                    var row = retainedMessagesTableBody.insertRow();";
+    html += "                    row.insertCell(0).innerText = topic;";
+    html += "                    row.insertCell(1).innerText = data.retainedMessages[topic];";
+    html += "                }";
+    html += "            }";
+    html += "            var connectedClientsTableBody = document.getElementById('connectedClientsTable').getElementsByTagName('tbody')[0];";
+    html += "            connectedClientsTableBody.innerHTML = '';";
+    html += "            data.connectedClients.forEach(function(item) {";
+    html += "                var row = connectedClientsTableBody.insertRow();";
+    html += "                row.insertCell(0).innerText = item.id;";
+    html += "                row.insertCell(1).innerText = item.lastSeen + ' ms ago';";
+    html += "                var topicsCell = row.insertCell(2);";
+    html += "                item.subscribedTopics.forEach(function(topic) {";
+    html += "                    topicsCell.innerHTML += topic + '<br>';";
+    html += "                });";
+    html += "            });";
+    html += "            document.getElementById('wifiSsid').innerText = data.wifi_ssid;";
+    html += "            document.getElementById('wifiIp').innerText = data.wifi_ip;";
+    html += "        }";
+    html += "    };";
+    html += "    xhr.open('GET', '/mqtt_data', true);";
+    html += "    xhr.send();";
+    html += "}";
+    html += "setInterval(fetchData, 2000);";
+    html += "window.onload = fetchData;";
+    html += "</script>";
+    html += "</body></html>";
+    web.send(200, "text/html", html);
+}
+
+void setupWebInterface() {
+    web.on("/", handleRoot);
+    web.on("/mqtt_data", handleMqttData);
+    web.begin();
+    Serial.println("HTTP server gestartet");
+}
+
+void setup() {
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.print("Verbinde mit WLAN");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+    Serial.println("Verbunden mit WLAN!");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+
+    mqttServer.begin();
+    Serial.printf("MQTT Broker laeuft auf Port %d\n", mqttPort);
+
+    setupWebInterface();
+}
+
+void sendPublish(WiFiClient &client, const String &topic, const String &payload, uint8_t qos = 0, bool retain = false, uint16_t packetId = 0) {
     if (!client.connected()) {
-        Serial.println("Error: Tried to send packet to disconnected client.");
+        Serial.println("Fehler: Versuch, PUBLISH an getrennten Client zu senden.");
         return;
     }
 
-    int remLen = variableHeaderAndPayload.size();
+    int len = topic.length();
+    int payloadLen = payload.length();
+
+    uint8_t fixedHeader = 0x30;
+    fixedHeader |= (qos << 1);
+    if (retain) fixedHeader |= 0x01;
+
+    int remLen = 2 + len + payloadLen;
+    if (qos > 0) {
+        remLen += 2;
+    }
+
     uint8_t encodedRemLen[4];
     int i = 0;
     do {
@@ -207,115 +318,61 @@ void sendMQTTPacket(WiFiClient &client, uint8_t fixedHeader, const std::vector<b
     for (int j = 0; j < i; ++j) {
         client.write(encodedRemLen[j]);
     }
-    client.write(variableHeaderAndPayload.data(), variableHeaderAndPayload.size());
-}
 
+    client.write((len >> 8) & 0xFF);
+    client.write(len & 0xFF);
+    client.print(topic);
 
-// =================================================================================================
-// MQTT PAKET SENDER FUNKTIONEN
-// =================================================================================================
-
-// Funktion zum Senden von MQTT Publish Paketen an Client
-void sendPublish(MQTTClientState& clientState, const String &topic, const String &payload, uint8_t qos, bool retain) {
-    WiFiClient& client = clientState.client;
-    if (!client.connected()) {
-        Serial.println("Error: Tried to send PUBLISH to disconnected client.");
-        return;
-    }
-
-    uint16_t packetId = 0;
     if (qos > 0) {
-        packetId = clientState.nextOutgoingPacketId++;
-        if (clientState.nextOutgoingPacketId == 0) clientState.nextOutgoingPacketId = 1; // Packet ID 0 ist reserviert
-        
-        // Nachricht in die Warteschlange für Retransmission legen
-        OutgoingMessage outMsg = {topic, payload, qos, retain, packetId, millis(), 0, 0};
-        clientState.outgoingQoSMessages[packetId] = outMsg;
+        client.write((packetId >> 8) & 0xFF);
+        client.write(packetId & 0xFF);
+    }
+    client.print(payload);
+}
+
+void distributeMessage(const String& topic, const String& payload, bool retain) {
+    Message msg = {topic, payload, millis()};
+    messageLog.push_back(msg);
+    if (messageLog.size() > 50) {
+        messageLog.erase(messageLog.begin());
     }
 
-    uint8_t fixedHeader = 0x30; // PUBLISH Typ
-    fixedHeader |= (qos << 1);  // QoS Bits setzen
-    if (retain) fixedHeader |= 0x01; // Retain Flag setzen
-
-    std::vector<byte> variableHeaderAndPayload;
-    
-    // Topic Name
-    variableHeaderAndPayload.push_back((topic.length() >> 8) & 0xFF);
-    variableHeaderAndPayload.push_back(topic.length() & 0xFF);
-    for (char c : topic) {
-        variableHeaderAndPayload.push_back(c);
+    if (retain) {
+        if (payload.length() == 0) {
+            retainedMessages.erase(topic);
+            Serial.printf("Retained message fuer Topic '%s' gelöscht.\n", topic.c_str());
+        } else {
+            retainedMessages[topic] = payload;
+            Serial.printf("Retained message fuer Topic '%s' aktualisiert.\n", topic.c_str());
+        }
     }
 
-    // Packet ID (nur für QoS 1 und 2)
-    if (qos > 0) {
-        variableHeaderAndPayload.push_back((packetId >> 8) & 0xFF);
-        variableHeaderAndPayload.push_back(packetId & 0xFF);
+    for (auto &sub : activeSubscriptions) {
+        if (sub.clientState->client.connected() && topicMatches(topic, sub.topicFilter)) {
+            Serial.printf("Weiterleiten an Subscriber '%s' fuer Topic: %s\n", sub.clientState->clientId.c_str(), sub.topicFilter.c_str());
+            sendPublish(sub.clientState->client, topic, payload, 0, retain);
+        }
     }
-
-    // Payload
-    for (char c : payload) {
-        variableHeaderAndPayload.push_back(c);
-    }
-
-    sendMQTTPacket(client, fixedHeader, variableHeaderAndPayload);
-    Serial.printf("PUBLISH gesendet an '%s': Topic='%s', Payload='%s', QoS=%d, PacketID=%d, Retain=%d\n", clientState.clientId.c_str(), topic.c_str(), payload.c_str(), qos, packetId, retain);
 }
 
-// Sendet ein PUBACK Paket
-void sendPubAck(WiFiClient& client, uint16_t packetId) {
-    std::vector<byte> variableHeader;
-    variableHeader.push_back((packetId >> 8) & 0xFF);
-    variableHeader.push_back(packetId & 0xFF);
-    sendMQTTPacket(client, 0x40, variableHeader); // PUBACK Fixed Header
-    Serial.printf("PUBACK gesendet für Packet ID %d\n", packetId);
-}
-
-// Sendet ein PUBREC Paket
-void sendPubRec(WiFiClient& client, uint16_t packetId) {
-    std::vector<byte> variableHeader;
-    variableHeader.push_back((packetId >> 8) & 0xFF);
-    variableHeader.push_back(packetId & 0xFF);
-    sendMQTTPacket(client, 0x50, variableHeader); // PUBREC Fixed Header
-    Serial.printf("PUBREC gesendet für Packet ID %d\n", packetId);
-}
-
-// Sendet ein PUBREL Paket
-void sendPubRel(WiFiClient& client, uint16_t packetId) {
-    std::vector<byte> variableHeader;
-    variableHeader.push_back((packetId >> 8) & 0xFF);
-    variableHeader.push_back(packetId & 0xFF);
-    sendMQTTPacket(client, 0x62, variableHeader); // PUBREL Fixed Header (QoS 1)
-    Serial.printf("PUBREL gesendet für Packet ID %d\n", packetId);
-}
-
-// Sendet ein PUBCOMP Paket
-void sendPubComp(WiFiClient& client, uint16_t packetId) {
-    std::vector<byte> variableHeader;
-    variableHeader.push_back((packetId >> 8) & 0xFF);
-    variableHeader.push_back(packetId & 0xFF);
-    sendMQTTPacket(client, 0x70, variableHeader); // PUBCOMP Fixed Header
-    Serial.printf("PUBCOMP gesendet für Packet ID %d\n", packetId);
-}
-
-// =================================================================================================
-// MQTT PAKET HANDLER FUNKTIONEN
-// =================================================================================================
-
-// Funktion zum Verarbeiten einer eingehenden PUBLISH-Nachricht
-void handlePublish(MQTTClientState& clientState, byte header, byte remainingLength) {
+void handlePublish(MQTTClientState& clientState, byte header, int remainingLength) {
     WiFiClient& client = clientState.client;
     uint8_t qos = (header >> 1) & 0x03;
     bool retain = (header & 0x01);
-    bool dup = (header >> 3) & 0x01; // DUP flag
+    bool dup = (header >> 3) & 0x01;
 
-    if (!waitForBytes(client, remainingLength)) {
-        Serial.println("Timeout bei PUBLISH Payload");
+    int expectedBytes = remainingLength;
+    if (!waitForBytes(client, expectedBytes)) {
+        Serial.println("Timeout beim Lesen der PUBLISH Payload.");
         return;
     }
 
-    byte topicLenMsb = client.read();
-    byte topicLenLsb = client.read();
-    int topicLen = (topicLenMsb << 8) | topicLenLsb;
+    int topicLen = (client.read() << 8) | client.read();
+    if (topicLen < 0 || topicLen > (remainingLength - 2)) {
+        Serial.printf("Fehler: Ungültige Topic-Länge (%d) im PUBLISH Paket. Trenne Client.\n", topicLen);
+        client.stop();
+        return;
+    }
 
     char topicChar[topicLen + 1];
     for (int i = 0; i < topicLen; i++) {
@@ -324,15 +381,17 @@ void handlePublish(MQTTClientState& clientState, byte header, byte remainingLeng
     topicChar[topicLen] = 0;
     String topic = String(topicChar);
 
+    int payloadLen = remainingLength - (2 + topicLen);
     uint16_t packetId = 0;
     if (qos > 0) {
-        byte packetIdMsb = client.read();
-        byte packetIdLsb = client.read();
-        packetId = (packetIdMsb << 8) | packetIdLsb;
+        if (payloadLen < 2) {
+            Serial.println("Fehler: QoS-Paket ohne Packet ID. Trenne Client.");
+            client.stop();
+            return;
+        }
+        packetId = (client.read() << 8) | client.read();
+        payloadLen -= 2;
     }
-
-    int payloadLen = remainingLength - (2 + topicLen);
-    if (qos > 0) payloadLen -= 2;
 
     String payload = "";
     if (payloadLen > 0) {
@@ -344,507 +403,290 @@ void handlePublish(MQTTClientState& clientState, byte header, byte remainingLeng
         payload = String(payloadChar);
     }
 
-    Serial.printf("PUBLISH empfangen von '%s': Topic='%s', Payload='%s', QoS=%d, PacketID=%d, Retain=%d, DUP=%d\n", clientState.clientId.c_str(), topic.c_str(), payload.c_str(), qos, packetId, retain, dup);
+    Serial.printf("PUBLISH empfangen von '%s': Topic='%s', Payload='%s', QoS=%d, Retain=%d, DUP=%d, PacketID=%d\n",
+                  clientState.clientId.c_str(), topic.c_str(), payload.c_str(), qos, retain, dup, packetId);
 
-    // QoS 1 Handling
-    if (qos == 1) {
-        sendPubAck(client, packetId);
-        // TODO: Hier könnte man eine einfache Duplicate-Erkennung für QoS 1 implementieren,
-        // indem man die Packet ID für eine kurze Zeit speichert und DUP-Nachrichten ignoriert.
-        // Für diese Implementierung wird die Nachricht immer verarbeitet.
-    }
-    // QoS 2 Handling
-    else if (qos == 2) {
-        // Prüfen, ob diese Packet ID bereits in Bearbeitung ist
-        if (clientState.incomingQoS2Messages.count(packetId) && clientState.incomingQoS2Messages[packetId].state == 0 && dup) {
-            // Dies ist ein Duplikat des initialen PUBLISH (DUP-Flag gesetzt), senden Sie PUBREC erneut
-            Serial.printf("QoS 2 DUP PUBLISH empfangen (Packet ID %d). Sende PUBREC erneut.\n", packetId);
-            sendPubRec(client, packetId);
-            return; // Nachricht nicht erneut verarbeiten
-        }
+    if (qos == 2) {
+        byte pubrec[] = {0x50, 0x02, (byte)(packetId >> 8), (byte)(packetId & 0xFF)};
+        client.write(pubrec, sizeof(pubrec));
+        Serial.printf("PUBREC gesendet fuer Packet ID %d an Client '%s'\n", packetId, clientState.clientId.c_str());
 
-        // Neue QoS 2 Nachricht oder erste Übertragung eines QoS 2 PUBLISH
-        IncomingQoS2State inMsg = {topic, payload, qos, packetId, millis(), 0};
-        clientState.incomingQoS2Messages[packetId] = inMsg;
-        sendPubRec(client, packetId);
-        clientState.incomingQoS2Messages[packetId].state = 1; // PUBREC gesendet
-        // Nachricht wird erst weitergeleitet, wenn PUBREL empfangen wurde
-    }
-
-    // Wenn QoS 0 oder QoS 1 (nach PUBACK) oder QoS 2 (nach vollem Handshake)
-    // Nur bei QoS 0 wird sofort weitergeleitet. QoS 1 und 2 werden später weitergeleitet.
-    if (qos == 0) {
-        Message msg = {topic, payload, millis()};
-        messageLog.push_back(msg);
-        if (messageLog.size() > 50) {
-            messageLog.erase(messageLog.begin());
-        }
-
-        if (retain) {
-            if (payload.length() == 0) {
-                retainedMessages.erase(topic);
-                Serial.printf("Retained message for topic '%s' cleared.\n", topic.c_str());
-            } else {
-                retainedMessages[topic] = payload;
-                Serial.printf("Retained message for topic '%s' updated.\n", topic.c_str());
-            }
-        }
-
-        // Weiterleiten an alle passenden Subscriber
-        for (auto &sub : activeSubscriptions) {
-            if (sub.clientState->client.connected() && topicMatches(topic, sub.topicFilter)) {
-                Serial.printf("Weiterleiten an Subscriber '%s' für Topic: %s (QoS %d)\n", sub.clientState->clientId.c_str(), sub.topicFilter.c_str(), sub.qos);
-                sendPublish(*sub.clientState, topic, payload, sub.qos, retain); // Sende mit dem QoS des Abonnenten
-            }
-        }
-    }
-}
-
-// Verarbeitet ein eingehendes PUBACK Paket (Antwort auf Broker-gesendetes QoS 1 PUBLISH)
-void handlePubAck(MQTTClientState& clientState, byte remainingLength) {
-    WiFiClient& client = clientState.client;
-    if (!waitForBytes(client, remainingLength)) {
-        Serial.println("Timeout bei PUBACK Payload");
-        return;
-    }
-    byte packetIdMsb = client.read();
-    byte packetIdLsb = client.read();
-    uint16_t packetId = (packetIdMsb << 8) | packetIdLsb;
-
-    Serial.printf("PUBACK empfangen von '%s' für Packet ID %d\n", clientState.clientId.c_str(), packetId);
-
-    // Nachricht aus der Warteschlange der ausgehenden QoS-Nachrichten entfernen
-    if (clientState.outgoingQoSMessages.count(packetId)) {
-        clientState.outgoingQoSMessages.erase(packetId);
-        Serial.printf("Ausgehende QoS 1 Nachricht (Packet ID %d) erfolgreich bestätigt.\n", packetId);
-    } else {
-        Serial.printf("Warnung: PUBACK für unbekannte oder bereits bestätigte Packet ID %d empfangen.\n", packetId);
-    }
-}
-
-// Verarbeitet ein eingehendes PUBREC Paket (Antwort auf Broker-gesendetes QoS 2 PUBLISH)
-void handlePubRec(MQTTClientState& clientState, byte remainingLength) {
-    WiFiClient& client = clientState.client;
-    if (!waitForBytes(client, remainingLength)) {
-        Serial.println("Timeout bei PUBREC Payload");
-        return;
-    }
-    byte packetIdMsb = client.read();
-    byte packetIdLsb = client.read();
-    uint16_t packetId = (packetIdMsb << 8) | packetIdLsb;
-
-    Serial.printf("PUBREC empfangen von '%s' für Packet ID %d\n", clientState.clientId.c_str(), packetId);
-
-    if (clientState.outgoingQoSMessages.count(packetId)) {
-        OutgoingMessage& outMsg = clientState.outgoingQoSMessages[packetId];
-        if (outMsg.qos == 2 && outMsg.state == 0) { // PUBLISH gesendet, warte auf PUBREC
-            outMsg.state = 1; // PUBREC empfangen, sende PUBREL
-            sendPubRel(client, packetId);
-            outMsg.timestampSent = millis(); // Update timestamp for PUBREL retransmission
-            outMsg.retryCount = 0; // Reset retry count for next step
-            Serial.printf("QoS 2 Handshake: PUBREC empfangen, sende PUBREL für Packet ID %d.\n", packetId);
+        String key = clientState.clientId + "-" + String(packetId);
+        if (!dup || !pendingQoS2.count(key)) {
+            pendingQoS2[key] = {topic, payload};
+            Serial.printf("QoS 2 Nachricht (Packet ID %d) von '%s' zur Bearbeitung vorgemerkt.\n", packetId, clientState.clientId.c_str());
         } else {
-            Serial.printf("Warnung: PUBREC für unerwarteten Zustand der Packet ID %d empfangen (QoS %d, State %d).\n", packetId, outMsg.qos, outMsg.state);
+            Serial.printf("QoS 2 Nachricht (Packet ID %d) von '%s' ist eine DUP-Nachricht, wurde bereits vorgemerkt.\n", packetId, clientState.clientId.c_str());
         }
+        return;
     } else {
-        Serial.printf("Warnung: PUBREC für unbekannte oder bereits bestätigte Packet ID %d empfangen.\n", packetId);
-        // Wenn unbekannt, sende PUBREL als Reaktion auf ein unerwartetes PUBREC
-        sendPubRel(client, packetId);
+        distributeMessage(topic, payload, retain);
+        if (qos == 1) {
+            byte puback[] = {0x40, 0x02, (byte)(packetId >> 8), (byte)(packetId & 0xFF)};
+            client.write(puback, sizeof(puback));
+            Serial.printf("PUBACK gesendet fuer Packet ID %d an Client '%s'\n", packetId, clientState.clientId.c_str());
+        }
     }
 }
 
-// Verarbeitet ein eingehendes PUBREL Paket (Antwort auf Broker-gesendetes PUBREC, oder Teil des eingehenden QoS 2 Handshakes)
-void handlePubRel(MQTTClientState& clientState, byte remainingLength) {
+void handlePubRel(MQTTClientState& clientState, int remainingLength) {
     WiFiClient& client = clientState.client;
-    if (!waitForBytes(client, remainingLength)) {
-        Serial.println("Timeout bei PUBREL Payload");
-        return;
-    }
-    byte packetIdMsb = client.read();
-    byte packetIdLsb = client.read();
-    uint16_t packetId = (packetIdMsb << 8) | packetIdLsb;
+    if (!waitForBytes(client, 2)) return;
+    uint16_t packetId = (client.read() << 8) | client.read();
+    Serial.printf("PUBREL empfangen von '%s' fuer Packet ID %d.\n", clientState.clientId.c_str(), packetId);
 
-    Serial.printf("PUBREL empfangen von '%s' für Packet ID %d\n", clientState.clientId.c_str(), packetId);
+    byte pubcomp[] = {0x70, 0x02, (byte)(packetId >> 8), (byte)(packetId & 0xFF)};
+    client.write(pubcomp, sizeof(pubcomp));
+    Serial.printf("PUBCOMP gesendet fuer Packet ID %d an Client '%s'.\n", packetId, clientState.clientId.c_str());
 
-    // Teil des eingehenden QoS 2 Handshakes
-    if (clientState.incomingQoS2Messages.count(packetId)) {
-        IncomingQoS2State& inMsg = clientState.incomingQoS2Messages[packetId];
-        if (inMsg.state == 1) { // PUBREC gesendet, warte auf PUBREL
-            inMsg.state = 2; // PUBREL empfangen
-            sendPubComp(client, packetId);
-            Serial.printf("QoS 2 Handshake: PUBREL empfangen, sende PUBCOMP für Packet ID %d.\n", packetId);
-
-            // Nachricht jetzt an Subscriber weiterleiten, da QoS 2 Handshake abgeschlossen ist
-            Message msg = {inMsg.topic, inMsg.payload, millis()};
-            messageLog.push_back(msg);
-            if (messageLog.size() > 50) {
-                messageLog.erase(messageLog.begin());
-            }
-
-            if (inMsg.qos == 2) { // Retain Flag wird vom originalen PUBLISH übernommen
-                // Da Retain ein Flag im PUBLISH ist, wird es hier nicht direkt verwendet,
-                // sondern die ursprüngliche Logik für Retained Messages im handlePublish
-                // würde das Retain-Flag des *eingehenden* PUBLISH berücksichtigen.
-                // Hier leiten wir nur die Nachricht weiter.
-                // Wenn die originale PUBLISH-Nachricht retain war, wurde sie bereits in retainedMessages gespeichert.
-            }
-
-            for (auto &sub : activeSubscriptions) {
-                if (sub.clientState->client.connected() && topicMatches(inMsg.topic, sub.topicFilter)) {
-                    Serial.printf("Weiterleiten an Subscriber '%s' für Topic: %s (QoS %d)\n", sub.clientState->clientId.c_str(), sub.topicFilter.c_str(), sub.qos);
-                    sendPublish(*sub.clientState, inMsg.topic, inMsg.payload, sub.qos, (inMsg.qos == 2 && inMsg.qos == 2)); // Retain Flag vom Original-PUBLISH
-                }
-            }
-            clientState.incomingQoS2Messages.erase(packetId); // Handshake abgeschlossen
-        } else {
-            Serial.printf("Warnung: PUBREL für unerwarteten Zustand der eingehenden QoS 2 Nachricht Packet ID %d empfangen (State %d).\n", packetId, inMsg.state);
-            // Sende PUBCOMP erneut, falls der Client es nicht erhalten hat
-            sendPubComp(client, packetId);
-        }
-    }
-    // Teil des ausgehenden QoS 2 Handshakes (Antwort auf Broker-gesendetes PUBREC)
-    else if (clientState.outgoingQoSMessages.count(packetId)) {
-        OutgoingMessage& outMsg = clientState.outgoingQoSMessages[packetId];
-        if (outMsg.qos == 2 && outMsg.state == 1) { // PUBREC gesendet, warte auf PUBREL
-            outMsg.state = 2; // PUBREL empfangen
-            sendPubComp(client, packetId);
-            outMsg.timestampSent = millis(); // Update timestamp for PUBCOMP retransmission
-            outMsg.retryCount = 0; // Reset retry count
-            Serial.printf("QoS 2 Handshake: PUBREL empfangen (ausgehend), sende PUBCOMP für Packet ID %d.\n", packetId);
-        } else {
-            Serial.printf("Warnung: PUBREL für unerwarteten Zustand der ausgehenden QoS 2 Nachricht Packet ID %d empfangen (QoS %d, State %d).\n", packetId, outMsg.qos, outMsg.state);
-        }
+    String key = clientState.clientId + "-" + String(packetId);
+    if (pendingQoS2.count(key)) {
+        auto msg = pendingQoS2[key];
+        distributeMessage(msg.topic, msg.payload, false);
+        pendingQoS2.erase(key);
+        Serial.printf("QoS 2 Nachricht (Packet ID %d) von '%s' erfolgreich verarbeitet und verteilt.\n", packetId, clientState.clientId.c_str());
     } else {
-        Serial.printf("Warnung: PUBREL für unbekannte Packet ID %d empfangen.\n", packetId);
-        // Wenn unbekannt, sende PUBCOMP als Reaktion auf ein unerwartetes PUBREL
-        sendPubComp(client, packetId);
+        Serial.printf("Fehler: PUBREL fuer unbekannte Packet ID %d von Client '%s' empfangen.\n", packetId, clientState.clientId.c_str());
     }
 }
 
-// Verarbeitet ein eingehendes PUBCOMP Paket (Antwort auf Broker-gesendetes PUBREL)
-void handlePubComp(MQTTClientState& clientState, byte remainingLength) {
+void handleSubscribe(MQTTClientState& clientState, byte header, int remainingLength) {
     WiFiClient& client = clientState.client;
-    if (!waitForBytes(client, remainingLength)) {
-        Serial.println("Timeout bei PUBCOMP Payload");
-        return;
+    if (!waitForBytes(client, remainingLength)) return;
+
+    uint16_t packetId = (client.read() << 8) | client.read();
+    
+    int bytesRead = 2;
+    while(bytesRead < remainingLength) {
+        int topicLen = (client.read() << 8) | client.read();
+        if (!waitForBytes(client, topicLen)) return;
+        char topicChar[topicLen + 1];
+        for (int i = 0; i < topicLen; i++) {
+            topicChar[i] = client.read();
+        }
+        topicChar[topicLen] = 0;
+        String topic = String(topicChar);
+        byte qos = client.read();
+
+        Serial.printf("Client '%s' SUBSCRIBEd to Topic: %s with requested QoS %d\n", clientState.clientId.c_str(), topic.c_str(), qos);
+
+        ActiveSubscription newSub;
+        newSub.clientState = &clientState;
+        newSub.topicFilter = topic;
+        activeSubscriptions.push_back(newSub);
+        clientState.subscribedTopics.push_back(topic);
+
+        // Sende Retained Messages
+        for (auto const& [retainedTopic, retainedPayload] : retainedMessages) {
+            if (topicMatches(retainedTopic, topic)) {
+                sendPublish(client, retainedTopic, retainedPayload, 0, true);
+            }
+        }
+        bytesRead += 2 + topicLen + 1;
     }
-    byte packetIdMsb = client.read();
-    byte packetIdLsb = client.read();
-    uint16_t packetId = (packetIdMsb << 8) | packetIdLsb;
-
-    Serial.printf("PUBCOMP empfangen von '%s' für Packet ID %d\n", clientState.clientId.c_str(), packetId);
-
-    // Nachricht aus der Warteschlange der ausgehenden QoS-Nachrichten entfernen
-    if (clientState.outgoingQoSMessages.count(packetId)) {
-        clientState.outgoingQoSMessages.erase(packetId);
-        Serial.printf("Ausgehende QoS 2 Nachricht (Packet ID %d) erfolgreich bestätigt.\n", packetId);
-    } else {
-        Serial.printf("Warnung: PUBCOMP für unbekannte oder bereits bestätigte Packet ID %d empfangen.\n", packetId);
-    }
-}
-
-
-void handleSubscribe(MQTTClientState& clientState, byte header, byte remainingLength) {
-    WiFiClient& client = clientState.client;
-
-    if (!waitForBytes(client, remainingLength)) {
-        Serial.println("Timeout bei SUBSCRIBE Payload");
-        return;
-    }
-
-    byte packetIdMsb = client.read();
-    byte packetIdLsb = client.read();
-    uint16_t packetId = (packetIdMsb << 8) | packetIdLsb;
-
-    // SUBSCRIBE kann mehrere Topic-Filter enthalten, hier nur der erste
-    byte topicLenMsb = client.read();
-    byte topicLenLsb = client.read();
-    int topicLen = (topicLenMsb << 8) | topicLenLsb;
-
-    char topicChar[topicLen + 1];
-    for (int i = 0; i < topicLen; i++) {
-        topicChar[i] = client.read();
-    }
-    topicChar[topicLen] = 0;
-    String topic = String(topicChar);
-
-    byte requestedQoS = client.read(); // QoS des Abonnenten für dieses Topic
-
-    Serial.printf("Client '%s' SUBSCRIBEd to Topic: %s with QoS %d\n", clientState.clientId.c_str(), topic.c_str(), requestedQoS);
-
-    // Sende SUBACK mit dem gewährten QoS (hier der angeforderte QoS)
-    // MQTT 3.1.1 erlaubt nur 0, 1, 2 als gewährten QoS. Wenn Client 3 anfordert, muss Broker 0, 1 oder 2 gewähren.
-    // Hier vereinfacht: Gewährter QoS ist der angeforderte QoS.
-    byte grantedQoS = requestedQoS;
-    if (grantedQoS > 2) grantedQoS = 0; // Ungültiger QoS wird auf 0 gesetzt
-
-    byte suback[] = {0x90, 0x03, packetIdMsb, packetIdLsb, grantedQoS};
+    
+    // Sende SUBACK
+    byte suback[] = {0x90, 0x03, (byte)(packetId >> 8), (byte)(packetId & 0xFF), 0x00}; // Return Code 0x00 für Success QoS 0
     client.write(suback, sizeof(suback));
-    Serial.printf("SUBACK gesendet für Packet ID %d mit Granted QoS %d\n", packetId, grantedQoS);
-
-    ActiveSubscription newSub;
-    newSub.clientState = &clientState;
-    newSub.topicFilter = topic;
-    newSub.qos = grantedQoS; // Speichere den gewährten QoS
-    activeSubscriptions.push_back(newSub);
-    clientState.subscribedTopics.push_back(topic);
-
-    // Sende Retained Messages an den neuen Subscriber
-    for (auto const& [retainedTopic, retainedPayload] : retainedMessages) {
-        if (topicMatches(retainedTopic, topic)) {
-            Serial.printf("Sende Retained Message für Topic '%s' an neuen Subscriber '%s'.\n", retainedTopic.c_str(), clientState.clientId.c_str());
-            sendPublish(clientState, retainedTopic, retainedPayload, grantedQoS, true); // Sende mit dem gewährten QoS
-        }
-    }
+    Serial.printf("SUBACK gesendet fuer Packet ID %d an Client '%s'\n", packetId, clientState.clientId.c_str());
 }
 
 void handlePingReq(MQTTClientState& clientState) {
-    WiFiClient& client = clientState.client;
     byte pingresp[] = {0xD0, 0x00};
-    client.write(pingresp, sizeof(pingresp));
-    Serial.printf("PINGRESP gesendet an Client '%s'\n", clientState.clientId.c_str());
-    clientState.lastSeen = millis();
+    clientState.client.write(pingresp, sizeof(pingresp));
+    Serial.printf("PINGRESP gesendet an Client '%s'.\n", clientState.clientId.c_str());
 }
 
-void processMQTTClient(MQTTClientState& clientState) {
-    WiFiClient& client = clientState.client;
+void handleDisconnect(MQTTClientState& clientState) {
+    Serial.printf("Client '%s' hat eine DISCONNECT-Nachricht gesendet. Trenne die Verbindung.\n", clientState.clientId.c_str());
+    clientState.client.stop();
+}
 
-    if (!client.connected()) {
-        return; // Client ist bereits getrennt
+void handlePubAck(MQTTClientState& clientState, int remainingLength) {
+    if (!waitForBytes(clientState.client, 2)) return;
+    uint16_t packetId = (clientState.client.read() << 8) | clientState.client.read();
+    Serial.printf("PUBACK empfangen von '%s' fuer Packet ID %d.\n", clientState.clientId.c_str(), packetId);
+}
+
+void handlePubComp(MQTTClientState& clientState, int remainingLength) {
+    if (!waitForBytes(clientState.client, 2)) return;
+    uint16_t packetId = (clientState.client.read() << 8) | clientState.client.read();
+    Serial.printf("PUBCOMP empfangen von '%s' fuer Packet ID %d.\n", clientState.clientId.c_str(), packetId);
+}
+
+void handlePubRec(MQTTClientState& clientState, int remainingLength) {
+    if (!waitForBytes(clientState.client, 2)) return;
+    uint16_t packetId = (clientState.client.read() << 8) | clientState.client.read();
+    Serial.printf("PUBREC empfangen von '%s' fuer Packet ID %d.\n", clientState.clientId.c_str(), packetId);
+}
+
+void removeClient(int index) {
+    MQTTClientState& clientState = connectedMQTTClients[index];
+    if (clientState.hasLWT) {
+        Serial.printf("Client '%s' hat die Verbindung unerwartet getrennt. Sende LWT-Nachricht.\n", clientState.clientId.c_str());
+        distributeMessage(clientState.willTopic, clientState.willMessage, false);
+    }
+    
+    activeSubscriptions.erase(std::remove_if(activeSubscriptions.begin(), activeSubscriptions.end(),
+                                             [&](const ActiveSubscription& sub) {
+                                                 return sub.clientState->clientId == clientState.clientId;
+                                             }),
+                              activeSubscriptions.end());
+    
+    connectedMQTTClients.erase(connectedMQTTClients.begin() + index);
+    Serial.printf("Client '%s' (IP: %s) hat die Verbindung getrennt. Anzahl verbundener MQTT-Clients: %d\n",
+                  clientState.clientId.c_str(), clientState.client.remoteIP().toString().c_str(), connectedMQTTClients.size());
+}
+
+
+void handleConnect(WiFiClient& client, byte header, int remainingLength) {
+    if (!waitForBytes(client, remainingLength)) {
+        Serial.println("Timeout beim Lesen der CONNECT-Nachricht.");
+        return;
     }
 
-    // Keep-Alive-Prüfung
-    if (clientState.clientKeepAliveSec > 0) {
-        unsigned long idleTime = millis() - clientState.lastSeen;
-        // Keep-Alive-Timeout ist 1.5 * Keep-Alive-Intervall
-        if (idleTime > (unsigned long)clientState.clientKeepAliveSec * 1500) {
-            Serial.printf("Client '%s' (ID: %s) Keep-Alive Timeout. Trenne Verbindung.\n",
-                          client.remoteIP().toString().c_str(), clientState.clientId.c_str());
-            if (clientState.hasLWT) {
-                Serial.printf("Veröffentliche Last Will and Testament für Client '%s' (Topic: '%s', Message: '%s').\n",
-                              clientState.clientId.c_str(), clientState.willTopic.c_str(), clientState.willMessage.c_str());
-                // LWT wird immer mit QoS 0 und Retain=false veröffentlicht, gemäß Spezifikation (außer anders konfiguriert)
-                // Hier wird es als normale PUBLISH-Nachricht an alle Subscriber gesendet.
-                for (auto &sub : activeSubscriptions) {
-                    if (sub.clientState->client.connected() && topicMatches(clientState.willTopic, sub.topicFilter)) {
-                        sendPublish(*sub.clientState, clientState.willTopic, clientState.willMessage, sub.qos, false);
-                    }
-                }
-            }
-            client.stop();
-            return;
-        }
+    int bytesRead = 0;
+    // Protocol Name
+    int protocolNameLen = (client.read() << 8) | client.read();
+    bytesRead += 2;
+    for (int i = 0; i < protocolNameLen; ++i) { client.read(); }
+    bytesRead += protocolNameLen;
+    // Protocol Version
+    client.read(); // version
+    bytesRead++;
+    // Connect Flags
+    byte connectFlags = client.read();
+    bytesRead++;
+    // Keep Alive
+    client.read(); client.read(); // keep alive
+    bytesRead += 2;
+
+    // Client ID
+    int clientIdLen = (client.read() << 8) | client.read();
+    bytesRead += 2;
+    if (!waitForBytes(client, clientIdLen)) { client.stop(); return; }
+    char clientIdChar[clientIdLen + 1];
+    for(int i = 0; i < clientIdLen; ++i) { clientIdChar[i] = client.read(); }
+    clientIdChar[clientIdLen] = 0;
+    String clientId = String(clientIdChar);
+    bytesRead += clientIdLen;
+
+    // LWT Topic und Message, falls vorhanden
+    String willTopic = "";
+    String willMessage = "";
+    bool hasLWT = (connectFlags & 0x04) != 0;
+    if (hasLWT) {
+        int willTopicLen = (client.read() << 8) | client.read();
+        bytesRead += 2;
+        if (!waitForBytes(client, willTopicLen)) { client.stop(); return; }
+        char willTopicChar[willTopicLen + 1];
+        for(int i = 0; i < willTopicLen; ++i) { willTopicChar[i] = client.read(); }
+        willTopicChar[willTopicLen] = 0;
+        willTopic = String(willTopicChar);
+        bytesRead += willTopicLen;
+
+        int willMessageLen = (client.read() << 8) | client.read();
+        bytesRead += 2;
+        if (!waitForBytes(client, willMessageLen)) { client.stop(); return; }
+        char willMessageChar[willMessageLen + 1];
+        for(int i = 0; i < willMessageLen; ++i) { willMessageChar[i] = client.read(); }
+        willMessageChar[willMessageLen] = 0;
+        willMessage = String(willMessageChar);
+        bytesRead += willMessageLen;
+    }
+    
+    // Benutzernamen und Passwort, falls vorhanden (werden hier ignoriert)
+    if (connectFlags & 0x80) { // Has Username
+        int usernameLen = (client.read() << 8) | client.read();
+        if (!waitForBytes(client, usernameLen)) { client.stop(); return; }
+        for(int i = 0; i < usernameLen; ++i) { client.read(); }
+        bytesRead += 2 + usernameLen;
+    }
+    if (connectFlags & 0x40) { // Has Password
+        int passwordLen = (client.read() << 8) | client.read();
+        if (!waitForBytes(client, passwordLen)) { client.stop(); return; }
+        for(int i = 0; i < passwordLen; ++i) { client.read(); }
+        bytesRead += 2 + passwordLen;
     }
 
-    // Retransmission-Logik für ausgehende QoS-Nachrichten
-    for (auto it = clientState.outgoingQoSMessages.begin(); it != clientState.outgoingQoSMessages.end(); ) {
-        OutgoingMessage& outMsg = it->second;
-        if (millis() - outMsg.timestampSent > QoS_TIMEOUT_MS) {
-            if (outMsg.retryCount < MAX_QOS_RETRIES) {
-                outMsg.retryCount++;
-                outMsg.timestampSent = millis(); // Update timestamp for next retry
-
-                Serial.printf("Retransmission: Sende PUBLISH/PUBREL erneut an '%s' (Packet ID %d, Retries %d)\n",
-                              clientState.clientId.c_str(), outMsg.packetId, outMsg.retryCount);
-
-                if (outMsg.qos == 1 || (outMsg.qos == 2 && outMsg.state == 0)) { // PUBLISH erneut senden (QoS 1 oder QoS 2 initial)
-                    uint8_t fixedHeader = 0x38; // PUBLISH mit DUP=1
-                    fixedHeader |= (outMsg.qos << 1);
-                    if (outMsg.retain) fixedHeader |= 0x01;
-
-                    std::vector<byte> variableHeaderAndPayload;
-                    variableHeaderAndPayload.push_back((outMsg.topic.length() >> 8) & 0xFF);
-                    variableHeaderAndPayload.push_back(outMsg.topic.length() & 0xFF);
-                    for (char c : outMsg.topic) variableHeaderAndPayload.push_back(c);
-                    variableHeaderAndPayload.push_back((outMsg.packetId >> 8) & 0xFF);
-                    variableHeaderAndPayload.push_back(outMsg.packetId & 0xFF);
-                    for (char c : outMsg.payload) variableHeaderAndPayload.push_back(c);
-                    sendMQTTPacket(client, fixedHeader, variableHeaderAndPayload);
-                } else if (outMsg.qos == 2 && outMsg.state == 1) { // PUBREL erneut senden
-                    sendPubRel(client, outMsg.packetId);
-                } else if (outMsg.qos == 2 && outMsg.state == 2) { // PUBCOMP erneut senden
-                    sendPubComp(client, outMsg.packetId);
-                }
-                ++it;
-            } else {
-                Serial.printf("Client '%s': Maximale Retransmissionen für Packet ID %d erreicht. Trenne Verbindung.\n", clientState.clientId.c_str(), outMsg.packetId);
-                client.stop();
-                it = clientState.outgoingQoSMessages.erase(it); // Client trennen und Nachricht entfernen
-                return; // Client wurde getrennt, beende Verarbeitung für diesen Client
-            }
-        } else {
-            ++it;
-        }
-    }
-
-    // Retransmission-Logik für eingehende QoS 2 Nachrichten (Broker sendet PUBREC/PUBCOMP erneut)
-    for (auto it = clientState.incomingQoS2Messages.begin(); it != clientState.incomingQoS2Messages.end(); ) {
-        IncomingQoS2State& inMsg = it->second;
-        if (millis() - inMsg.timestampReceived > QoS_TIMEOUT_MS) {
-            // Hier keine retryCount, da der Client das DUP-Flag setzt.
-            // Wir senden einfach das letzte ACK-Paket erneut.
-            if (inMsg.state == 1) { // PUBREC wurde gesendet, warte auf PUBREL
-                Serial.printf("Retransmission: Sende PUBREC erneut an '%s' für Packet ID %d.\n", clientState.clientId.c_str(), inMsg.packetId);
-                sendPubRec(client, inMsg.packetId);
-            } else if (inMsg.state == 2) { // PUBREL wurde empfangen, warte auf PUBCOMP
-                Serial.printf("Retransmission: Sende PUBCOMP erneut an '%s' für Packet ID %d.\n", clientState.clientId.c_str(), inMsg.packetId);
-                sendPubComp(client, inMsg.packetId);
-            }
-        }
-        ++it;
-    }
-
-
-    // Verarbeite eingehende Datenpakete
-    if (client.available() >= 2) {
-        byte h = client.read();
-        byte len = client.read();
-
-        int packetType = h >> 4;
-        uint8_t flags = h & 0x0F; // Flags für spezifische Pakettypen
-
-        switch (packetType) {
-            case 1: // CONNECT (sollte nur einmal am Anfang kommen)
-                Serial.printf("Warnung: Client '%s' sendet CONNECT erneut. Ignoriere.\n", clientState.clientId.c_str());
-                // Read and discard remaining bytes for this packet to avoid blocking
-                for (int i = 0; i < len && client.available(); ++i) client.read();
-                break;
-            case 3: // PUBLISH
-                handlePublish(clientState, h, len);
-                break;
-            case 4: // PUBACK
-                handlePubAck(clientState, len);
-                break;
-            case 5: // PUBREC
-                handlePubRec(clientState, len);
-                break;
-            case 6: // PUBREL
-                handlePubRel(clientState, len);
-                break;
-            case 7: // PUBCOMP
-                handlePubComp(clientState, len);
-                break;
-            case 8: // SUBSCRIBE
-                handleSubscribe(clientState, h, len);
-                break;
-            case 12: // PINGREQ
-                handlePingReq(clientState);
-                break;
-            case 14: // DISCONNECT
-                Serial.printf("Client '%s' DISCONNECT requested. Closing connection.\n", clientState.clientId.c_str());
-                client.stop();
-                break;
-            default:
-                Serial.printf("Client '%s': Unbekannter Pakettyp 0x%X, Länge %d. Trenne Verbindung.\n", clientState.clientId.c_str(), packetType, len);
-                // Lese und verwerfe die restlichen Bytes, um den Stream zu leeren, bevor die Verbindung geschlossen wird
-                for (int i = 0; i < len && client.available(); ++i) client.read();
-                client.stop();
-                break;
-        }
-    }
+    MQTTClientState newState;
+    newState.client = client;
+    newState.clientId = clientId;
+    newState.lastSeen = millis();
+    newState.hasLWT = hasLWT;
+    newState.willTopic = willTopic;
+    newState.willMessage = willMessage;
+    connectedMQTTClients.push_back(newState);
+    
+    byte connack[] = {0x20, 0x02, 0x00, 0x00};
+    client.write(connack, sizeof(connack));
+    Serial.printf("Client '%s' CONNECTED. Sende CONNACK.\n", clientId.c_str());
 }
 
 void loop() {
     web.handleClient();
 
-    // Neue eingehende MQTT-Verbindungen prüfen
     WiFiClient newClient = mqttServer.available();
     if (newClient) {
         Serial.println("Neue TCP-Verbindung erkannt.");
-        MQTTClientState newState;
-        newState.client = newClient;
-        newState.lastSeen = millis();
-        newState.hasLWT = false; // Standardmäßig keine LWT
-        connectedMQTTClients.push_back(newState);
-        Serial.printf("Anzahl verbundener MQTT-Clients: %d\n", connectedMQTTClients.size());
-    }
-
-    // Verarbeite alle verbundenen MQTT-Clients
-    // Iteriere rückwärts, um sichere Entfernung zu ermöglichen
-    for (int i = connectedMQTTClients.size() - 1; i >= 0; --i) {
-        if (connectedMQTTClients[i].client.connected()) {
-            // Wenn der Client noch auf das CONNACK wartet, verarbeite das CONNECT-Paket
-            if (!connectedMQTTClients[i].connectedACKSent) {
-                WiFiClient& client = connectedMQTTClients[i].client;
-                if (client.available() >= 2) {
-                    byte header = client.peek(); // Nur lesen, nicht verbrauchen
-                    byte remainingLength = client.peek(1); // Nur lesen, nicht verbrauchen
-
-                    if ((header >> 4) == 1) { // CONNECT-Paket
-                        client.read(); // Verbrauche Header
-                        client.read(); // Verbrauche Remaining Length
-
-                        if (!waitForBytes(client, remainingLength)) {
-                            Serial.printf("Timeout processing CONNECT payload for client %s. Disconnecting.\n", connectedMQTTClients[i].client.remoteIP().toString().c_str());
-                            client.stop();
-                            // Entfernung erfolgt im nächsten Loop-Durchlauf
-                            continue;
-                        }
-
-                        // Protokoll Name (MQTT), Version
-                        for (int k = 0; k < 8; ++k) client.read();
-
-                        byte connectFlags = client.read(); // Connect Flags
-                        connectedMQTTClients[i].clientKeepAliveSec = (client.read() << 8) | client.read(); // Keep-Alive
-
-                        // Client ID
-                        connectedMQTTClients[i].clientId = readLengthPrefixedString(client);
-
-                        // Will Topic und Will Message (falls vorhanden)
-                        bool willFlag = (connectFlags >> 2) & 0x01;
-                        if (willFlag) {
-                            connectedMQTTClients[i].willTopic = readLengthPrefixedString(client);
-                            connectedMQTTClients[i].willMessage = readLengthPrefixedString(client);
-                            connectedMQTTClients[i].hasLWT = true;
-                        }
-
-                        // User Name und Password (falls vorhanden) - hier ignoriert für diese Implementierung
-                        bool userNameFlag = (connectFlags >> 7) & 0x01;
-                        if (userNameFlag) {
-                            readLengthPrefixedString(client); // Read and discard username
-                        }
-                        bool passwordFlag = (connectFlags >> 6) & 0x01;
-                        if (passwordFlag) {
-                            readLengthPrefixedString(client); // Read and discard password
-                        }
-
-                        Serial.printf("Client '%s' (IP: %s) CONNECTED. Keep-Alive: %d sec. Sending CONNACK.\n",
-                                      connectedMQTTClients[i].clientId.c_str(), connectedMQTTClients[i].client.remoteIP().toString().c_str(),
-                                      connectedMQTTClients[i].clientKeepAliveSec);
-
-                        byte connack[] = {0x20, 0x02, 0x00, 0x00}; // CONNACK: Session Present = 0, Connect Acknowledge Flags = 0 (Connection Accepted)
-                        client.write(connack, sizeof(connack));
-                        connectedMQTTClients[i].connectedACKSent = true;
-                        connectedMQTTClients[i].lastSeen = millis(); // Update lastSeen after CONNECT
-                    } else {
-                        Serial.printf("Client '%s' sent non-CONNECT first packet (0x%X). Disconnecting.\n", connectedMQTTClients[i].client.remoteIP().toString().c_str(), header);
-                        client.stop();
-                        // Entfernung erfolgt im nächsten Loop-Durchlauf
-                        continue;
-                    }
+        if (newClient.connected()) {
+            if (!waitForBytes(newClient, 1)) {
+                newClient.stop();
+                return;
+            }
+            byte header = newClient.peek();
+            byte packetType = (header >> 4) & 0x0F;
+            if (packetType == 0x01) { // CONNECT
+                newClient.read(); // Header lesen
+                int remainingLength = decodeRemainingLength(newClient);
+                if (remainingLength > 0) {
+                    handleConnect(newClient, header, remainingLength);
+                } else {
+                    Serial.println("Fehler: Ungültige Remaining Length im CONNECT-Paket.");
+                    newClient.stop();
                 }
             } else {
-                // Client ist verbunden und CONNACK wurde gesendet, verarbeite normale MQTT-Pakete
-                processMQTTClient(connectedMQTTClients[i]);
+                Serial.println("Erstes Paket ist kein CONNECT. Verbindung getrennt.");
+                newClient.stop();
+            }
+        }
+    }
+
+    for (int i = 0; i < connectedMQTTClients.size(); ++i) {
+        MQTTClientState& clientState = connectedMQTTClients[i];
+        WiFiClient& client = clientState.client;
+
+        if (client.connected()) {
+            if (client.available()) {
+                byte header = client.read();
+                int remainingLength = decodeRemainingLength(client);
+                if (remainingLength == -1) {
+                    Serial.printf("Fehler: Ungültige Remaining Length von Client '%s'. Trenne Verbindung.\n", clientState.clientId.c_str());
+                    client.stop();
+                    continue;
+                }
+
+                clientState.lastSeen = millis();
+                byte packetType = (header >> 4) & 0x0F;
+
+                switch (packetType) {
+                    case 0x03: handlePublish(clientState, header, remainingLength); break;
+                    case 0x08: handleSubscribe(clientState, header, remainingLength); break;
+                    case 0x0C: handlePingReq(clientState); break;
+                    case 0x0E: handleDisconnect(clientState); break;
+                    case 0x04: handlePubAck(clientState, remainingLength); break;
+                    case 0x05: handlePubRec(clientState, remainingLength); break;
+                    case 0x06: handlePubRel(clientState, remainingLength); break;
+                    case 0x07: handlePubComp(clientState, remainingLength); break;
+                    default:
+                        Serial.printf("Unbekannter MQTT-Pakettyp: 0x%02X von Client '%s'. Trenne.\n", packetType, clientState.clientId.c_str());
+                        client.stop();
+                        break;
+                }
             }
         } else {
-            Serial.printf("Client '%s' (ID: %s, IP: %s) hat die Verbindung getrennt. Entferne ihn.\n",
-                            connectedMQTTClients[i].clientId.c_str(),
-                            connectedMQTTClients[i].client.remoteIP().toString().c_str(),
-                            connectedMQTTClients[i].client.remoteIP().toString().c_str());
-
-            // Entferne alle Abonnements dieses Clients
-            activeSubscriptions.erase(std::remove_if(activeSubscriptions.begin(), activeSubscriptions.end(),
-                                                     [&](const ActiveSubscription& sub) {
-                                                         return sub.clientState == &connectedMQTTClients[i];
-                                                     }),
-                                      activeSubscriptions.end());
-            // Entferne ausstehende QoS-Nachrichten für diesen Client
-            connectedMQTTClients[i].outgoingQoSMessages.clear();
-            connectedMQTTClients[i].incomingQoS2Messages.clear();
-
-            // Entferne den Client aus der Liste
-            connectedMQTTClients.erase(connectedMQTTClients.begin() + i);
+            removeClient(i);
+            i--;
         }
     }
 }
