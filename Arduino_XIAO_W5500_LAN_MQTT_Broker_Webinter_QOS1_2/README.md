@@ -15,7 +15,8 @@ Console output with local IP:
 
 MQTT Client on mobil phone:
 
-<img width="945" height="2048" alt="image" src="https://github.com/user-attachments/assets/db5b0180-a50c-4974-9529-73eaf0145ff6" />
+<img width="490" height="1024" alt="image" src="https://github.com/user-attachments/assets/db5b0180-a50c-4974-9529-73eaf0145ff6" />
+
 
 
 
