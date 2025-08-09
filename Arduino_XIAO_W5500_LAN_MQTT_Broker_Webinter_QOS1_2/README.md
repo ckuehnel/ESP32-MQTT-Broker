@@ -9,5 +9,9 @@ Here the LAN connection is used to get a wired connection between the local brok
 
 The screenshots show the working MQTT broker. 
 
+Console output with local IP:
+
+<img width="1042" height="292" alt="image" src="https://github.com/user-attachments/assets/17251c55-b02f-4ef6-ac9f-e71575dbff70" />
+
 
 
