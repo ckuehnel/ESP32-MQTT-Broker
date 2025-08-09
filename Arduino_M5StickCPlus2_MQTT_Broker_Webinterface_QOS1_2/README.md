@@ -12,4 +12,4 @@ Connectivity \& Ports: USB-C with updated CH9102 USB-UART interface and same Gro
 
 Its WiFi Connection is used here to connect to the local network.
 
-<img width="512" height="768" alt="Instagram Post" src="https://github.com/user-attachments/assets/f5b9aa3a-73d3-4560-8dbd-dd4ebe18b4c6" />
+<img width="256" height="384" alt="Instagram Post" src="https://github.com/user-attachments/assets/f5b9aa3a-73d3-4560-8dbd-dd4ebe18b4c6" />
