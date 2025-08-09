@@ -8,3 +8,6 @@ installation and enhances system performance.
 Here the LAN connection is used to get a wired connection between the local broker and the router.
 
 The screenshots show the working MQTT broker. 
+
+
+
