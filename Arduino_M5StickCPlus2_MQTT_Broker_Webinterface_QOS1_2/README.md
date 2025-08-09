@@ -10,7 +10,5 @@ Hardware: Maintains all core functionality — IR, RTC, microphone, IMU, buttons
 
 Connectivity \& Ports: USB-C with updated CH9102 USB-UART interface and same Grove/HAT compatibility. 
 
-Its WiFi Connection is used here to connect the local network.
-
-Arduino_M5StickCPlus2_MQTT_Broker_Webinterface_QOS1_2/Instagram Post.png
+Its WiFi Connection is used here to connect to the local network.
 
